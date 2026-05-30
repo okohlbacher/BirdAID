@@ -106,7 +106,10 @@ function M.run(opts)
             if isCanceled() then break end
             sleep(0.05)
         end
+        -- Re-check BOTH cancel and breaker AFTER the capacity wait (either may flip during it) so we
+        -- never fetch/dispatch one extra anchor past a cancel or a breaker-open mid-wait.
         if isCanceled() then markRemaining(i, 'cancelled'); break end
+        if breakerOpen() then markRemaining(i, 'deferred'); break end
 
         -- PRODUCER: MAIN-TASK serial preview fetch (the reliable path — one render at a time).
         local job = fetchJob(key)

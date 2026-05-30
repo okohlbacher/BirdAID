@@ -316,7 +316,9 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             width = transport.width, height = transport.height,
         }
         http.attachImage(previewImage)
-        return { image = previewImage, ctx = ctx, file = file }
+        -- Carry the ORIGINAL Lr photo handle in the job: identifyAfterFetch needs it for the
+        -- experimental full-res crop export (cropper.exportFullRes). It is NOT sent to the AI.
+        return { image = previewImage, ctx = ctx, file = file, photo = photo }
     end
 
     -- identifyAfterFetch(job, atIndex, cropGate) -> (response, err). Everything AFTER the preview
@@ -327,6 +329,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local file = job.file
         local ctx = job.ctx
         local previewImage = job.image
+        local photo = job.photo   -- ORIGINAL handle (for the experimental full-res crop export only)
 
         -- ---- LIVE identify on the preview (generic provider) -------------
         local det, ierr = provider.identify(previewImage, ctx)
@@ -627,7 +630,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- (token now gates ONLY the provider call, not the preview fetch); crop re-queries use the
         -- shared cropGate. Returns the gate's plain (status, response).
         local function consumerIdentify(job)
-            local status, resp = workerGate.gate({
+            local status, resp, err = workerGate.gate({
                 item       = job,
                 bucket     = bucket,
                 now        = cropWallClock,
@@ -636,6 +639,12 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                 breaker    = breaker,
                 identify   = function(it) return identifyAfterFetch(it, it.atIndex, cropGate) end,
             })
+            -- A crop-gate refusal inside identifyAfterFetch returns (nil, 'cancelled'|'deferred'),
+            -- which worker_gate maps to 'fatal' with that err. Re-surface the true terminal status
+            -- so a crop-path cancel/defer is not mislabelled fatal (crop is experimental/off).
+            if status == 'fatal' and (err == 'cancelled' or err == 'deferred') then
+                return err, nil
+            end
             return status, resp
         end
 
