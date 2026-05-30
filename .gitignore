@@ -1,0 +1,9 @@
+# Build output — the packaged .lrplugin is produced by tools/build.sh and should not be committed
+dist/
+
+# macOS Finder metadata
+.DS_Store
+
+# Internal GSD planning artifacts + local agent settings — not part of the public product
+.planning/
+.claude/
