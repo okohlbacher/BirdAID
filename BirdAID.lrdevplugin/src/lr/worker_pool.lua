@@ -70,21 +70,18 @@ local LrTasks = import 'LrTasks'
 local LrDate
 pcall(function() LrDate = import 'LrDate' end)
 
-local poolMod = require 'src.net.pool'
-local log     = require 'src.log'
+local poolMod  = require 'src.net.pool'
+local gateMod  = require 'src.net.worker_gate'
+local log      = require 'src.log'
 
 local M = {}
 
--- A sentinel error value that the worker body raises when the after-token breaker gate finds the
--- breaker OPEN. It is a TABLE (not a string) so it can never collide with a real provider error
--- string, and the worker classifies it as 'deferred' (NEVER 'fatal'/'identified').
-local DEFERRED_SENTINEL = { deferred = true }
-
--- A sentinel the worker body raises when, AFTER the token wait, cooperative cancel is observed
--- immediately before the provider call. It is a TABLE so it can never collide with a real provider
--- error string. The worker classifies it as 'cancelled' (the provider is NEVER called); the pool
--- controller resolves the item 'cancelled' and its cluster-followers cancel via the results join.
-local CANCELLED_SENTINEL = { cancelled = true }
+-- NOTE: the per-provider-call DECISION LOGIC (token take -> after-token cancel gate -> after-token
+-- breaker gate -> identify) lives in the PURE src.net.worker_gate module so it is unit-testable
+-- offline. This glue injects the REAL Lr dependencies (LrTasks.sleep, the real clock, the real
+-- cancel/breaker/identify) and only handles startAsyncTask scheduling + the yield-safe ypcall wrap.
+-- The pure gate returns plain status strings and never raises; the only raise this glue traps is a
+-- THROW escaping a throwing identify/sleep, which classify maps to an isolated 'fatal'.
 
 -- wallClockSeconds() -> a monotonically-advancing real-time seconds value (NOT CPU time).
 local function wallClockSeconds()
@@ -100,33 +97,6 @@ local function safeCanceled(isCanceled)
     if type(isCanceled) ~= 'function' then return false end
     local ok, c = pcall(isCanceled)
     return (ok and c) or false
-end
-
--- acquireToken(bucket, sleep): take ONE token, sleeping (on the TASK, not in a pcall) until granted.
--- A nil bucket (no rate limiter) is treated as unlimited. Returns nothing; it blocks the worker
--- cooperatively until a token is in hand. The CALLER invokes this INSIDE the yield-safe pcall body
--- (LrTasks.sleep yields), so the sleep is pinned correctly.
-local function acquireToken(bucket, sleep)
-    if type(bucket) ~= 'table' or type(bucket.take) ~= 'function' then
-        return                                   -- no bucket -> unlimited, no token cost.
-    end
-    while true do
-        local ok, wait = bucket.take(wallClockSeconds())
-        if ok then return end
-        -- Not enough tokens: sleep the reported wait (>=0). Guard a bad/absent wait with a small
-        -- floor so we always yield and re-check (never a busy spin).
-        local w = tonumber(wait)
-        if type(w) ~= 'number' or w ~= w or w < 0 then w = 0 end
-        if w < 0.001 then w = 0.001 end
-        sleep(w)
-    end
-end
-
--- breakerOpen(breaker) -> bool. READ-ONLY shouldStop; never records.
-local function breakerOpen(breaker)
-    return type(breaker) == 'table'
-        and type(breaker.shouldStop) == 'function'
-        and breaker.shouldStop() == true
 end
 
 -- M.run(opts) — see the RETURN CONTRACT in the header.
@@ -194,58 +164,46 @@ function M.run(opts)
     end
 
     -- ---- one worker's per-item body (runs INSIDE the yield-safe pcall) -------------------------
-    -- Returns (response, err); RAISES CANCELLED_SENTINEL when cancel is observed after the token wait,
-    -- or DEFERRED_SENTINEL when the after-token breaker gate is open. ORDER (BLOCKER C + B):
-    --   acquireToken -> (isCanceled? -> cancelled) -> (shouldStop? -> deferred) -> else identifyFn.
+    -- The per-PROVIDER-CALL DECISION LOGIC is the PURE gate (src.net.worker_gate). The glue injects
+    -- the REAL dependencies: LrTasks.sleep (yields cooperatively; bucket.take may sleep up to 1/rate,
+    -- so cancel/breaker can flip DURING the wait), the real monotonic clock, the real isCanceled /
+    -- breaker / identifyFn, and the shared per-call bucket. The gate performs EXACTLY: acquire a token
+    -- -> (isCanceled? -> 'cancelled') -> (shouldStop? -> 'deferred') -> else identifyFn (BLOCKER C+B).
+    -- It returns a plain (status, response, err); it NEVER raises for a normal outcome.
     local function workerBody(item)
-        -- (1) TAKE A TOKEN (per-provider-call cost). LrTasks.sleep yields — pinned inside ypcall.
-        --     bucket.take itself may LrTasks.sleep up to 1/rate, so cancel/breaker may flip DURING it.
-        acquireToken(bucket, LrTasks.sleep)
-        -- (2a) AFTER-TOKEN CANCEL GATE (BLOCKER B): re-check cooperative cancel IMMEDIATELY before the
-        -- provider call. A worker can sleep waiting for a token while cancel happens mid-wait; without
-        -- this re-check it would pass the breaker gate and still call the provider. If cancelled now,
-        -- do NOT call the provider — raise the cancelled sentinel so the worker classifies the item
-        -- 'cancelled' (its followers cancel via the results join). A token already taken just paces.
-        if safeCanceled(isCanceled) then
-            error(CANCELLED_SENTINEL)
-        end
-        -- (2b) AFTER-TOKEN BREAKER GATE: re-read shouldStop immediately before the provider call. If
-        -- open, do NOT call the provider — raise the deferred sentinel so the worker classifies the
-        -- item 'deferred' (NEVER 'identified', even though the provider would return a valid degrade).
-        if breakerOpen(breaker) then
-            error(DEFERRED_SENTINEL)
-        end
-        -- (3) CALL THE PROVIDER. identifyFn closes over the preview fetch + provider.identify (+ any
-        -- crop re-query, each of which takes its OWN token + re-checks cancel + shouldStop via the
-        -- shared isCanceled/bucket/breaker the orchestrator threaded in).
-        return identifyFn(item)
+        return gateMod.gate({
+            item       = item,
+            bucket     = bucket,
+            now        = wallClockSeconds,
+            sleep      = LrTasks.sleep,
+            isCanceled = isCanceled,
+            breaker    = breaker,
+            identify   = identifyFn,
+        })
     end
 
-    -- classify a worker body's outcome into a pool terminal status + the collected (response,err).
-    -- ok=false + err==CANCELLED_SENTINEL -> 'cancelled' (cancel observed after the token wait, before
-    -- the provider call); ok=false + err==DEFERRED_SENTINEL -> 'deferred'; ok=false (any other err) ->
-    -- 'fatal' (an isolated per-item failure, never aborts the run); ok=true + response -> 'identified';
-    -- ok=true + (nil,err) -> 'fatal'. Only 'identified' carries a response into responseByAnchorKey.
-    local function classify(item, ok, a, b)
+    -- classify the gate's outcome (run inside the yield-safe ypcall) into a pool terminal status.
+    -- NORMAL: the pure gate returns (status, response, err) and ypcall reports ok=true; we pass that
+    -- status straight through (only 'identified' carries a response). ABNORMAL: a THROW escaping a
+    -- throwing identify/sleep makes ypcall report ok=false; that isolated per-item failure becomes
+    -- 'fatal' (never aborts the run). Only 'identified' carries a response into responseByAnchorKey.
+    local function classify(item, ok, a, b, c)
         if not ok then
-            -- a is the raised error (a sentinel table OR an error string/object).
-            if a == CANCELLED_SENTINEL then
-                return 'cancelled', nil, nil
-            end
-            if a == DEFERRED_SENTINEL then
-                return 'deferred', nil, nil
-            end
+            -- a is the raised error (an error string/object). Isolated per-item failure -> fatal.
             log.warn("worker body failed (isolated; item deferred-as-fatal; run continues)", {
                 runId = runId, error = tostring(a),
             })
             return 'fatal', nil, tostring(a)
         end
-        -- ok: a = response|nil, b = err.
-        local response, err = a, b
-        if response ~= nil and err == nil then
+        -- ok: the gate returned (status, response, err).
+        local status, response, err = a, b, c
+        if status == 'identified' then
             return 'identified', response, nil
+        elseif status == 'fatal' then
+            return 'fatal', nil, (err ~= nil and tostring(err) or 'identify-failed')
         end
-        return 'fatal', nil, (err ~= nil and tostring(err) or 'identify-failed')
+        -- 'cancelled' / 'deferred': no response, no error.
+        return status, nil, nil
     end
 
     -- ---- spawn up to maxConcurrency cooperative workers ---------------------------------------
@@ -269,8 +227,10 @@ function M.run(opts)
                 if action == 'dispatch' then
                     local item = d.key
                     -- RUN THE ENTIRE YIELDING BODY INSIDE THE YIELD-SAFE pcall (never a bare pcall).
-                    local ok, a, b = ypcall(function() return workerBody(item) end)
-                    local status, response = classify(item, ok, a, b)
+                    -- The body delegates to the PURE gate which returns (status, response, err); on a
+                    -- THROW (throwing identify/sleep) ypcall reports ok=false and a is the error.
+                    local ok, a, b, c = ypcall(function() return workerBody(item) end)
+                    local status, response = classify(item, ok, a, b, c)
                     -- Record the terminal outcome into the PURE controller (frees the slot).
                     pool.onResult(item, status)
                     if status == 'identified' and response ~= nil then

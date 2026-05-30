@@ -157,36 +157,32 @@ do
 end
 
 -- =====================================================================
--- CANCEL-DURING-A-TOKEN-WAIT (BLOCKER B ordering). Model the worker's AFTER-TOKEN cancel gate:
--- an anchor is dispatched while NOT cancelled, the worker sleeps waiting for a token, cancel
--- happens DURING that wait, and the worker re-checks isCanceled IMMEDIATELY after the token wait
--- (before the provider call). Because cancel is observed at that after-token point, the provider is
--- NEVER called; the worker reports onResult(key,'cancelled') and the pure controller resolves the
--- anchor terminal-'cancelled' (NEVER 'identified'). A `provider not called` sentinel proves the
--- ordering acquireToken -> (isCanceled? -> cancelled) -> ... never reached identifyFn.
+-- CANCEL-DURING-A-TOKEN-WAIT (BLOCKER B ordering) — POOL-CONTROLLER side ONLY.
+--
+-- IMPORTANT: the actual AFTER-TOKEN cancel GATE (acquireToken -> isCanceled? -> cancelled, NEVER
+-- identify) is now the PURE src.net.worker_gate module and is driven for real in
+-- test/worker_gate_spec.lua — which flips cancel DURING the injected token-wait sleep and asserts
+-- identify is NEVER called (call-count 0). That replaces the prior MANUAL MODEL here (a local
+-- `providerCalled` flag + a hand-written onResult call that never touched the gate logic).
+--
+-- This case now asserts ONLY what genuinely belongs to the PURE controller: given the worker's
+-- verdict (onResult(key,'cancelled')), the pool resolves the anchor terminal-'cancelled' (NEVER
+-- 'identified'), stops new dispatch, cancels the undispatched remainder, and never records.
 -- =====================================================================
 do
     local br = spyBreaker()
     local p = pool.new({ items = { 'anchor', 'sibling' }, maxConcurrency = 1, breaker = br })
-    local providerCalled = false   -- flips true ONLY if the (modelled) provider call runs.
 
     local d = p.nextDispatch(0)
     assert_eq(d.action, 'dispatch', "anchor dispatched while NOT cancelled")
 
-    -- The worker takes a token (it would sleep here). Cancel happens DURING the token wait:
+    -- Cancel happens DURING the worker's token wait (modelled in the glue / proven in worker_gate_spec).
     p.cancel()
-    -- After the token wait the worker's AFTER-TOKEN cancel gate sees isCanceled()==true FIRST
-    -- (before the breaker gate and before identifyFn): it does NOT call the provider.
-    local cancelledNow = true
-    if not cancelledNow then
-        providerCalled = true   -- would only run if the gate failed to observe cancel.
-    end
+    -- The worker's after-token cancel gate (worker_gate) verdict arrives as a 'cancelled' result:
     p.onResult('anchor', 'cancelled')
 
-    assert_true(providerCalled == false,
-        "cancel-after-token-wait: provider NEVER called (gate observed cancel before identifyFn)")
     assert_eq(p.terminalStatus().anchor, 'cancelled',
-        "cancel-during-token-wait -> anchor cancelled (NEVER identified)")
+        "controller: an after-token-gate 'cancelled' verdict -> anchor cancelled (NEVER identified)")
     -- no new dispatch once cancelled; the in-flight already resolved -> drains to done.
     assert_eq(p.nextDispatch(0).action, 'done', "cancelled + nothing in flight -> done")
     assert_eq(p.terminalStatus().sibling, 'cancelled', "undispatched sibling -> cancelled")
