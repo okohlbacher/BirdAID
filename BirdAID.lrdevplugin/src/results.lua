@@ -70,16 +70,24 @@ function M.build(opts)
             if anchorKey == nil then
                 -- this photo is an ANCHOR (or a non-clustered photo): use its own status.
                 local eff = effectiveStatus(anchorStatus[photoKey])
+                local resp = anchorResponse[photoKey]
+                -- an 'identified' anchor with a MISSING / non-table response is INVALID: degrade
+                -- the whole cluster to 'deferred' (never emit identified with a nil response).
+                if eff == 'identified' and type(resp) ~= 'table' then eff = 'deferred' end
                 result = { photo = photoKey, status = eff }
                 if eff == 'identified' then
-                    result.response = anchorResponse[photoKey]
+                    result.response = resp
                 end
             else
                 -- this photo is a FOLLOWER: inherit the anchor's EFFECTIVE cluster status.
                 local eff = effectiveStatus(anchorStatus[anchorKey])
+                local resp = anchorResponse[anchorKey]
+                -- same guard at the cluster level: a follower of an 'identified' anchor whose
+                -- response is missing/invalid degrades to 'deferred' (no response inherited).
+                if eff == 'identified' and type(resp) ~= 'table' then eff = 'deferred' end
                 result = { photo = photoKey, status = eff, inheritedFrom = anchorKey }
                 if eff == 'identified' then
-                    result.response = anchorResponse[anchorKey]
+                    result.response = resp
                 end
             end
 

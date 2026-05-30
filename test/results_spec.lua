@@ -195,3 +195,35 @@ do
     assert_eq(out.byPhoto.a.status, 'deferred', "deferred anchor")
     assert_eq(out.byPhoto.a.response, nil, "a stray response on a deferred anchor does NOT leak")
 end
+
+-- =====================================================================
+-- S2: an 'identified' anchor with a MISSING / invalid response must NOT yield identified+nil.
+-- It (and its followers) DEGRADE to 'deferred' (no response, no keywords).
+-- =====================================================================
+do
+    local out = results.build({
+        selection = { 'a', 'f' },
+        anchors = { 'a' },
+        followerToAnchor = { f = 'a' },
+        anchorStatus = { a = 'identified' },
+        anchorResponse = {},   -- MISSING response for the identified anchor.
+    })
+    assert_eq(out.byPhoto.a.status, 'deferred', "identified anchor w/ missing response -> deferred")
+    assert_eq(out.byPhoto.a.response, nil, "degraded anchor carries NO response")
+    assert_eq(out.byPhoto.f.status, 'deferred', "follower of degraded anchor -> deferred")
+    assert_eq(out.byPhoto.f.response, nil, "degraded follower carries NO response")
+    assert_eq(out.byPhoto.f.inheritedFrom, 'a', "follower still records its anchor")
+end
+
+-- a non-table (invalid) response also degrades.
+do
+    local out = results.build({
+        selection = { 'a' },
+        anchors = { 'a' },
+        followerToAnchor = {},
+        anchorStatus = { a = 'identified' },
+        anchorResponse = { a = "not-a-table" },   -- INVALID response type.
+    })
+    assert_eq(out.byPhoto.a.status, 'deferred', "identified anchor w/ non-table response -> deferred")
+    assert_eq(out.byPhoto.a.response, nil, "no response leaked from a degraded anchor")
+end
