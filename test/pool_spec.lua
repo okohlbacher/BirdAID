@@ -279,3 +279,39 @@ do
     assert_eq(p2.state().inFlight, 1, "maxConcurrency 0.5 clamps to 1")
     assert_eq(p2.nextDispatch(0).action, 'idle', "only one slot when clamped to 1")
 end
+
+-- =====================================================================
+-- N1b (CODEX W1-R2 #2): a NON-FINITE maxConcurrency (NaN / +inf / -inf) is guarded to the
+-- floor/min-1 path. WITHOUT the guard, math.floor(inf)==inf makes `inFlight >= maxConcurrency`
+-- ALWAYS false -> the pool dispatches EVERY item at once (over-dispatch, no concurrency limit).
+-- The controller must instead behave like the serial (1-slot) cap: exactly ONE in flight, the
+-- next dispatch idles, and it never errors.
+-- =====================================================================
+do
+    local NAN = 0 / 0
+    local INF = 1 / 0
+
+    -- +inf must NOT over-dispatch: clamps to the serial (1-slot) floor.
+    local pInf = pool.new({ items = { 'a', 'b', 'c' }, maxConcurrency = INF, breaker = spyBreaker() })
+    local d1 = pInf.nextDispatch(0)
+    assert_eq(d1.action, 'dispatch', "inf maxConcurrency: first dispatch proceeds")
+    assert_eq(pInf.state().inFlight, 1, "inf maxConcurrency clamps to 1 (exactly one in flight)")
+    assert_eq(pInf.nextDispatch(0).action, 'idle',
+        "inf maxConcurrency does NOT over-dispatch: second call idles (slot full)")
+    -- freeing the slot lets the next item dispatch (normal serial drain, no error).
+    pInf.onResult(d1.key, 'identified')
+    assert_eq(pInf.state().inFlight, 0, "slot freed after result")
+    assert_eq(pInf.nextDispatch(0).action, 'dispatch', "inf cap behaves serially: next dispatches after free")
+
+    -- NaN behaves identically (already guarded; assert the observable behavior, not just the code).
+    local pNan = pool.new({ items = { 'a', 'b' }, maxConcurrency = NAN, breaker = spyBreaker() })
+    pNan.nextDispatch(0)
+    assert_eq(pNan.state().inFlight, 1, "NaN maxConcurrency clamps to 1 (one in flight)")
+    assert_eq(pNan.nextDispatch(0).action, 'idle', "NaN maxConcurrency does NOT over-dispatch (idle)")
+
+    -- -inf is also non-finite and < 1; must clamp to 1, not error.
+    local pNegInf = pool.new({ items = { 'a', 'b' }, maxConcurrency = -INF, breaker = spyBreaker() })
+    pNegInf.nextDispatch(0)
+    assert_eq(pNegInf.state().inFlight, 1, "-inf maxConcurrency clamps to 1")
+    assert_eq(pNegInf.nextDispatch(0).action, 'idle', "-inf maxConcurrency does NOT over-dispatch (idle)")
+end

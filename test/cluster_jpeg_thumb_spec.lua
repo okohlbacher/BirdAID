@@ -174,6 +174,59 @@ do
     assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC2)), nil, "SOF2 (progressive) => nil")
 end
 
+-- =====================================================================
+-- S4 (CODEX W1-R2 #4): FULL SOF allow-list. ONLY baseline SOF0 (0xC0) may decode; EVERY other
+-- SOFn marker (0xC1, 0xC3, 0xC5..0xC7, 0xC9..0xCF) MUST fail-open to nil. And the three non-SOF
+-- markers that fall in the 0xC1..0xCF range -- DHT (0xC4), JPG/reserved (0xC8), DAC (0xCC) -- must
+-- NOT be misinterpreted as a SOF: a stream carrying one of them but NO valid SOF0 yields nil (no
+-- frame header parsed). This proves the marker == 0xC0 ONLY decode path and the
+-- (>=0xC1 and <=0xCF and ~=0xC4 and ~=0xC8 and ~=0xCC) reject predicate in src/cluster/jpeg_thumb.lua.
+-- =====================================================================
+do
+    local raw = F.gray_sceneC
+    -- locate the SOF0 (0xFFC0) marker in the valid baseline fixture.
+    local sof = nil
+    local i = 1
+    while i < #raw do
+        if raw:byte(i) == 0xFF and raw:byte(i + 1) == 0xC0 then sof = i; break end
+        i = i + 1
+    end
+    assert_true(sof ~= nil, "found the SOF0 marker for the full allow-list sweep")
+
+    -- CONTROL: the UNMUTATED baseline SOF0 (0xC0) decodes to a 64-cell grid (only SOF0 decodes).
+    assert_eq(cells(jt.dcLumaGrid(raw)), 64, "control: baseline SOF0 (0xC0) DOES decode (64 cells)")
+
+    -- The complete set of non-baseline SOF markers (mutate the SOF0 marker byte to each in turn).
+    -- Already covered above: 0xC1, 0xC2, 0xC9. Here we cover the REMAINING SOFn allow-list entries.
+    local nonBaselineSOF = {
+        { 0xC3, "SOF3 (lossless, Huffman)" },
+        { 0xC5, "SOF5 (differential sequential)" },
+        { 0xC6, "SOF6 (differential progressive)" },
+        { 0xC7, "SOF7 (differential lossless)" },
+        { 0xCA, "SOF10 (progressive, arithmetic)" },
+        { 0xCB, "SOF11 (lossless, arithmetic)" },
+        { 0xCD, "SOF13 (differential sequential, arithmetic)" },
+        { 0xCE, "SOF14 (differential progressive, arithmetic)" },
+        { 0xCF, "SOF15 (differential lossless, arithmetic)" },
+    }
+    for _, m in ipairs(nonBaselineSOF) do
+        local code, name = m[1], m[2]
+        assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, code)), nil,
+            string.format("%s (0x%02X) is NOT baseline SOF0 => nil", name, code))
+    end
+
+    -- The three NON-SOF markers in the 0xC1..0xCF band MUST NOT be treated as a SOF. Mutating the
+    -- ONLY SOF0 in the stream to DHT/JPG/DAC removes the baseline frame header entirely; with no
+    -- valid SOF0 remaining the decoder has no frame to decode => nil (it must NOT parse the
+    -- DHT/JPG/DAC marker as if it were a frame header).
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC4)), nil,
+        "DHT (0xC4) is NOT a SOF: with the only SOF0 overwritten by DHT, no frame header => nil")
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC8)), nil,
+        "JPG/reserved (0xC8) is NOT a SOF: no valid SOF0 remains => nil")
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xCC)), nil,
+        "DAC (0xCC) is NOT a SOF: no valid SOF0 remains => nil")
+end
+
 -- An invalid / empty Huffman table (DHT with all-zero counts -> buildHuff returns nil) => nil, no raise.
 do
     -- a minimal JPEG: SOI, a DHT whose 16 BITS counts are ALL ZERO (empty table) -> reject.

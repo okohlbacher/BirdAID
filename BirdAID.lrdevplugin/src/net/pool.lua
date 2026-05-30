@@ -56,8 +56,14 @@ function M.new(opts)
     local items = type(opts.items) == 'table' and opts.items or {}
     -- defensively FLOOR + clamp maxConcurrency (settings already floors it, but the controller is
     -- the last line of defence): a fractional / sub-1 value collapses to 1 so inFlight gating is sane.
+    local INF = 1 / 0
     local maxConcurrency = math.floor(tonumber(opts.maxConcurrency) or 1)
     if maxConcurrency ~= maxConcurrency then maxConcurrency = 1 end  -- NaN guard.
+    -- inf / -inf guard: math.floor(inf) == inf (NOT caught by the NaN or <1 checks below), which
+    -- would make `inFlight >= maxConcurrency` ALWAYS false and dispatch EVERY item at once (no
+    -- concurrency limit -> over-dispatch). Collapse a non-finite cap to the serial floor (1), the
+    -- same conservative path as NaN / sub-1.
+    if maxConcurrency == INF or maxConcurrency == -INF then maxConcurrency = 1 end
     if maxConcurrency < 1 then maxConcurrency = 1 end
     local breaker = opts.breaker
 

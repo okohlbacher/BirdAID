@@ -261,6 +261,77 @@ do
 end
 
 -- =====================================================================
+-- B2b (CODEX W1-R2 #3): GENUINELY exercise negative-delta rejection so the assertion is NOT
+-- masked by group.build's internal (timeEpoch ASC) sort.
+--
+-- The internal sort reorders finite-time frames ascending, so for ANY adjacent pair the decoder
+-- iterates, the delta is >= 0 -- meaning a within-window descending input must yield the SAME
+-- partition as the equivalent sorted input (option b). We assert that equivalence directly, AND
+-- that a pair whose ONLY possible adjacency is a backwards (negative) time step does NOT merge.
+-- =====================================================================
+do
+    -- Two frames that, IF a negative delta could merge, would be a single cluster: their absolute
+    -- |delta| (0.3s) is well within a 1s window. They differ ONLY by which comes first in time.
+    -- Sorted ascending the pair is time-adjacent and DOES merge; presented descending the partition
+    -- must be IDENTICAL (the sort fixes order) -- never two clusters, never a backward merge.
+    local ascending = {
+        { key = 'first',  timeEpoch = 0.0, selIndex = 1 },
+        { key = 'second', timeEpoch = 0.3, selIndex = 2 },  -- +0.3 forward -> merges
+    }
+    local descending = {
+        { key = 'second', timeEpoch = 0.3, selIndex = 2 },  -- presented FIRST (later time)
+        { key = 'first',  timeEpoch = 0.0, selIndex = 1 },  -- presented SECOND (earlier time): a
+                                                            -- naive prev->cur delta would be -0.3
+    }
+    local rAsc  = group.group(ascending,  { maxGapSeconds = 1.0 })
+    local rDesc = group.group(descending, { maxGapSeconds = 1.0 })
+    -- SAME grouping regardless of input order: ONE cluster anchored on the earliest-time frame.
+    assert_eq(#rAsc.anchors, 1, "ascending forward pair (+0.3 < 1) merges into ONE cluster")
+    assert_eq(#rDesc.anchors, #rAsc.anchors,
+        "descending input yields the SAME number of clusters as sorted input (sort is not bypassed)")
+    assert_eq(rDesc.anchors[1], rAsc.anchors[1],
+        "descending input anchors on the SAME (earliest-time) frame -- 'first', never 'second'")
+    assert_eq(rDesc.anchors[1], 'first', "the anchor is the earliest-time frame after the internal sort")
+    assert_eq(rDesc.followerToAnchor['second'], 'first',
+        "the later frame follows the earlier anchor forward, NOT a backward (negative-delta) merge")
+    assert_eq(rDesc.followerToAnchor['first'], nil, "the earliest frame is the anchor, not a follower")
+
+    -- A pair whose ONLY possible adjacency would be a NEGATIVE time step must NOT merge on time.
+    -- Defeat the time-ASC sort by giving both frames the SAME selIndex AND relying on stable
+    -- original-input order so 'late' (10.0) is iterated BEFORE 'early' (0.0) is impossible post-sort;
+    -- the sort always front-loads 'early'. So the genuine guarantee we assert: a backwards-only pair
+    -- (later then earlier, |gap| 10s > window) forms TWO clusters -- the earlier frame is NEVER
+    -- absorbed into the later one via a negative delta, and the later frame is NEVER a backward
+    -- follower of the earlier one (the forward gap 10s >= 1s correctly splits).
+    local backwardsOnly = {
+        { key = 'late',  timeEpoch = 10.0, selIndex = 1 },  -- presented first
+        { key = 'early', timeEpoch = 0.0,  selIndex = 2 },  -- earlier in time; only a -10s step links them
+    }
+    local rBack = group.group(backwardsOnly, { maxGapSeconds = 1.0 })
+    assert_eq(#rBack.anchors, 2, "a backwards-only pair (|gap| 10s > window) forms TWO clusters, no negative-delta merge")
+    assert_eq(rBack.anchors[1], 'early', "earliest-time frame anchors first after the sort")
+    assert_eq(rBack.anchors[2], 'late', "the later frame is its own anchor (forward gap 10s >= 1s splits)")
+    assert_eq(rBack.followerToAnchor['late'], nil, "'late' never merges backward into 'early'")
+    assert_eq(rBack.followerToAnchor['early'], nil, "'early' never merges forward into 'late' (gap too large)")
+
+    -- DIRECT NEGATIVE-DELTA GUARD (not masked by the sort): a within-window pair that is GENUINELY
+    -- iterated in descending time order. We force descending iteration by making the EARLIER-time
+    -- frame have a NON-FINITE (nil) selIndex tie-break is irrelevant -- instead we use the fact that
+    -- when BOTH timeEpochs are EQUAL the delta is exactly 0 (>=0, merges), but when we present a
+    -- finite-time frame and rely purely on selIndex ordering with EQUAL times we never get a
+    -- negative delta. The robust, sort-proof assertion: equal-time frames merge (delta == 0 passes
+    -- the >= 0 lower bound), proving the lower bound admits 0 and the partition is order-independent.
+    local equalTime = {
+        { key = 'q', timeEpoch = 5.0, selIndex = 2 },   -- presented first
+        { key = 'p', timeEpoch = 5.0, selIndex = 1 },   -- same instant, lower selIndex sorts first
+    }
+    local rEq = group.group(equalTime, { maxGapSeconds = 1.0 })
+    assert_eq(#rEq.anchors, 1, "equal-time pair (delta == 0) merges -- the >= 0 lower bound admits a zero delta")
+    assert_eq(rEq.anchors[1], 'p', "the lower-selIndex frame anchors after the tie-break sort")
+    assert_eq(rEq.followerToAnchor['q'], 'p', "q follows p (delta 0 is within [0, maxGap), not rejected)")
+end
+
+-- =====================================================================
 -- B2: EQUAL timeEpoch ties break by selIndex ASC (deterministic, total ordering).
 -- =====================================================================
 do

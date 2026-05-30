@@ -179,3 +179,67 @@ do
     assert_true(has(out, 'width="60"'), "inverted bbox ordered: width = (0.8-0.2)*100 = 60")
     assert_true(not has(out, 'width="-'), "no negative width from an inverted bbox")
 end
+
+-- =====================================================================
+-- S2 (CODEX W1-R2 #1): a bbox carrying NaN and/or inf coordinates is REJECTED/skipped (NOT
+-- rendered as a garbage rect), proving denorm()'s NaN/inf guard in src/viz/svg.lua. A NaN/inf
+-- coord must produce NO <rect> for that detection, while a VALID sibling detection still renders.
+-- =====================================================================
+do
+    local NAN = 0 / 0
+    local INF = 1 / 0
+
+    -- a single detection whose bbox has a NaN coord -> NO rect (skipped, not garbage).
+    local nanOut = svg.render({
+        frameW = 100, frameH = 100,
+        detections = { { bbox = { NAN, 0.2, 0.6, 0.8 }, label = "L", title = "T" } },
+    })
+    assert_true(has(nanOut, "<svg"), "NaN-coord bbox still yields a valid <svg>")
+    assert_true(not has(nanOut, "<rect"), "a bbox with a NaN coord renders NO <rect> (rejected)")
+    assert_true(not has(nanOut, "nan") and not has(nanOut, "NaN"),
+        "no literal nan leaks into the output as a garbage coord")
+
+    -- +inf and -inf coords are likewise rejected.
+    local infOut = svg.render({
+        frameW = 100, frameH = 100,
+        detections = { { bbox = { 0.1, 0.2, INF, 0.8 }, label = "L", title = "T" } },
+    })
+    assert_true(not has(infOut, "<rect"), "a bbox with +inf coord renders NO <rect> (rejected)")
+    assert_true(not has(infOut, "inf") and not has(infOut, "Inf"),
+        "no literal inf leaks into the output")
+
+    local negInfOut = svg.render({
+        frameW = 100, frameH = 100,
+        detections = { { bbox = { 0.1, -INF, 0.6, 0.8 }, label = "L", title = "T" } },
+    })
+    assert_true(not has(negInfOut, "<rect"), "a bbox with -inf coord renders NO <rect> (rejected)")
+
+    -- all four coords NaN -> still no rect, no raise.
+    local allNan = svg.render({
+        frameW = 100, frameH = 100,
+        detections = { { bbox = { NAN, NAN, NAN, NAN }, label = "L", title = "T" } },
+    })
+    assert_true(not has(allNan, "<rect"), "an all-NaN bbox renders NO <rect>")
+
+    -- a NaN/inf detection is SKIPPED but a valid sibling in the same render still draws its rect,
+    -- proving the guard rejects only the bad detection (not the whole render).
+    local mixed = svg.render({
+        frameW = 100, frameH = 100,
+        detections = {
+            { bbox = { NAN, 0.2, 0.6, 0.8 }, label = "bad",  title = "bad" },   -- rejected
+            { bbox = { 0.0, 0.0, 1.0, 1.0 }, label = "good", title = "good" },  -- valid
+        },
+    })
+    local function countSub(s, sub)
+        local n, pos = 0, 1
+        while true do
+            local f = s:find(sub, pos, true)
+            if not f then break end
+            n = n + 1; pos = f + 1
+        end
+        return n
+    end
+    assert_eq(countSub(mixed, "<rect"), 1, "exactly ONE rect: the NaN detection skipped, the valid one drawn")
+    assert_true(has(mixed, ">good<") or has(mixed, ">good "), "the valid sibling label renders")
+    assert_true(not has(mixed, "bad"), "the rejected detection's label does NOT render")
+end
