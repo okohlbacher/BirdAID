@@ -1,5 +1,5 @@
 -- SPDX-License-Identifier: MIT
--- BirdAID.lrdevplugin/IdentifyBirds.lua (HARD-01 — the real shipping menu command)
+-- BirdAID.lrdevplugin/IdentifyBirds.lua (HARD-01 + Phase 9 — the real shipping menu command)
 --
 -- The menu entry point Lightroom invokes from Library > Plug-in Extras > "Identify
 -- Birds in Selected Photos...". This is the REAL end-to-end pipeline for the USER'S
@@ -18,6 +18,25 @@
 --     run; tracks HONEST processed/errors/cancelled/deferred counters.
 --   * Guarantees progress:done() (and the crop-dir cleanup) runs on normal completion,
 --     cancel, AND unexpected error via context:addCleanupHandler.
+--
+-- ===========================================================================
+-- PHASE 9 (BL-06 parallel / BL-07 cluster / BL-04 report) — DEFAULT-SAFE HARD BYPASS
+-- ===========================================================================
+-- The three Phase-9 features ship OFF by default. The #1 invariant (orchestrate.featuresOff):
+--   maxConcurrency==1 AND clusterBursts==false AND showDetectionReport==false
+--     => the EXISTING SERIAL CODE PATH runs VERBATIM and the worker_pool / clustering /
+--        jpeg_thumb / similarity / results.build / viz_report modules are NEVER required,
+--        constructed, or called. The pure orchestrate helper + the e2e spy spec assert this.
+-- Only on the FEATURE branch (some feature on) does the orchestrator:
+--   (0) sweep prior reports UNCONDITIONALLY at run start (mirrors the crop orphan-sweep);
+--   (1) optional cluster pre-pass (clusterBursts) -> anchors + follower->anchor map;
+--   (2) dispatch ANCHORS via worker_pool.run (shared capacity-1 token bucket + breaker), CONSUME
+--       its returned { statusByAnchorKey, responseByAnchorKey };
+--   (3) results.build -> one per-photo result for EVERY selected photo;
+--   (3b) results->writeplan ADAPTER (photoKey->handle + PER-PHOTO existingNames, NEVER inherited);
+--   (4) the EXISTING writeplan.planReport -> dry-run-log OR the single batched apply (UNCHANGED);
+--   (5) optional detection report (showDetectionReport), post-collect, OUTSIDE the gate.
+-- The feature requires are LAZY (only reached on the feature branch) so the bypass never loads them.
 --
 -- PROVIDER (generic, multi-provider): deps are built ONCE via http.buildDeps(prefs.provider)
 -- (one Keychain read, model reconciled to the selected provider) and the provider is
@@ -57,6 +76,7 @@ local contract       = require 'src.contract'
 local writeplan      = require 'src.writeplan'
 local breakerMod     = require 'src.net.breaker'
 local metadata       = require 'src.metadata'
+local orchestrate    = require 'src.orchestrate'       -- PURE Wave-3 composition (bypass predicate + adapter)
 local http           = require 'src.lr.http'           -- the SHARED generic Lr glue (ALL providers)
 local providers      = require 'src.providers.init'    -- the GENERIC provider selector
 local previewFetch   = require 'src.lr.preview_fetch'
@@ -123,6 +143,10 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local maxCropEdge = prefs.maxCropEdge
     local threshold   = prefs.confidenceThreshold
 
+    -- PHASE 9: the HARD default-safe bypass predicate (PURE). When true, NONE of the feature
+    -- modules are required/constructed/called -- the existing serial loop runs verbatim below.
+    local featuresOff = orchestrate.featuresOff(prefs)
+
     -- Platform-capability decision (pure): MAC_ENV/WIN_ENV are LrC globals -> an OS token ->
     -- capabilities. Off-macOS crop_supported is false with a clear, surfaceable reason.
     local osToken = MAC_ENV and 'macos' or (WIN_ENV and 'windows' or 'unknown')
@@ -136,6 +160,9 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         runId = runId, targetPhotos = n, provider = prefs.provider, model = prefs.model,
         rateLimit = rateLimit, previewSize = maxEdge, dryRun = prefs.dryRun,
         cropEnabled = prefs.cropEnabled, os = osToken, logFile = logPath,
+        -- token-free Phase-9 mode counters.
+        maxConcurrency = prefs.maxConcurrency, clusterBursts = prefs.clusterBursts,
+        showDetectionReport = prefs.showDetectionReport, featuresOff = featuresOff,
     })
 
     if n == 0 then
@@ -241,248 +268,411 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     context:addCleanupHandler(function() progress:done() end)
     if progress.setCancelable then progress:setCancelable(true) end
 
-    -- ---- COLLECT PHASE (entirely OUTSIDE any write gate) ----------------------
-    local results      = {}
-    local processed    = 0    -- photos whose body completed (preview fetched + identify attempted).
-    local errors       = 0    -- isolated per-photo failures.
-    local wasCancelled = false
-    local deferred     = 0    -- photos skipped after the breaker opened.
-    local cropsRun     = 0
-    local cropsSkipped = 0
+    -- ===========================================================================
+    -- SHARED per-photo identify body (used by BOTH the serial bypass loop AND the
+    -- feature-branch worker_pool identifyFn). It runs preview fetch + metadata + provider
+    -- identify (+ optional crop re-query) and returns (response, nil) | (nil, err). It performs
+    -- NO catalog write (collect stays OUTSIDE the gate) and NO breaker-defer decision (the
+    -- provider owns the breaker; the serial loop reads shouldStop after; the worker_pool gate
+    -- re-reads shouldStop before each provider call). `atIndex` is for logging only.
+    -- ===========================================================================
+    local function identifyOnePhoto(photo, atIndex)
+        local file = photoName(photo)
 
-    for i, photo in ipairs(photos) do
-        if cancelled(progress) then
-            wasCancelled = true
-            log.info("cancelled by user", { runId = runId, atIndex = i, processed = processed, total = n })
-            break
+        -- ---- Preview fetch -------------------------------------------------
+        local transport, reason = previewFetch.fetch(photo, maxEdge, {
+            isCanceled = function() return cancelled(progress) end,
+            file       = file,
+            runId      = runId,
+        })
+        if not transport then
+            log.info("preview not ready (skipping identify; run continues)", {
+                runId = runId, atIndex = atIndex, file = file, reason = tostring(reason),
+            })
+            return nil, "preview:" .. tostring(reason)
         end
 
-        progress:setPortionComplete(i - 1, n)
-        progress:setCaption(string.format("Photo %d of %d", i, n))
+        -- ---- Metadata read + PURE shape (privacy-gated) -------------------
+        local raw = metadataReader.read(photo)
+        local ctx = metadata.shape(raw, rawPrefs)
+        ctx.runId = runId
 
-        -- Capture a photoKey BEFORE the pcall body so a collect failure still records an error.
-        local photoKey = tostring(photo)
+        -- ---- LIVE identify on the preview (generic provider) -------------
+        local previewImage = {
+            kind = transport.kind, data = transport.data,
+            width = transport.width, height = transport.height,
+        }
+        http.attachImage(previewImage)
+        local det, ierr = provider.identify(previewImage, ctx)
 
-        local ok, err = LrTasks.pcall(function()
-            local file = photoName(photo)
+        -- RE-validate (defence in depth). A degrade {bird_present=false} is valid.
+        local previewResult, verr = nil, nil
+        if det ~= nil then
+            local vok, vmsg = contract.validateResponse(det)
+            if vok then previewResult = det else verr = tostring(vmsg) end
+        else
+            verr = tostring(ierr)
+        end
 
-            -- ---- Preview fetch -------------------------------------------------
-            local transport, reason = previewFetch.fetch(photo, maxEdge, {
-                isCanceled = function() return cancelled(progress) end,
-                file       = file,
-                runId      = runId,
+        if previewResult == nil then
+            log.info("identify produced no usable response (skipping; run continues)", {
+                runId = runId, atIndex = atIndex, file = file, reason = verr or 'identify-failed',
             })
-            if not transport then
-                results[#results + 1] = {
-                    photoKey      = photoKey,
-                    photo         = photo,
-                    response      = nil,
-                    error         = "preview:" .. tostring(reason),
-                    existingNames = catalogWriter.readExistingNames(photo),
-                }
-                log.info("preview not ready (skipping identify; run continues)", {
-                    runId = runId, atIndex = i, file = file, reason = tostring(reason),
+            return nil, verr or 'identify-failed'
+        end
+
+        -- ---- OPT-IN EXPERIMENTAL PER-DETECTION CROP PASS -----------------
+        local finalResult = previewResult
+        if cropActive
+            and previewResult.bird_present
+            and type(previewResult.detections) == 'table'
+            and #previewResult.detections > 0 then
+
+            local okTool, toolWhy = cropper.validateToolPath(prefs.imageToolPath)
+            if not (okTool and true or false) then
+                log.info("crop tool unavailable (skipping crop pass; using preview)", {
+                    runId = runId, atIndex = atIndex, file = file, reason = tostring(toolWhy),
                 })
-                return
-            end
-
-            -- ---- Metadata read + PURE shape (privacy-gated) -------------------
-            local raw = metadataReader.read(photo)
-            local ctx = metadata.shape(raw, rawPrefs)
-            ctx.runId = runId
-
-            -- ---- LIVE identify on the preview (generic provider) -------------
-            -- http.attachImage sets BOTH image.dataUrl (OpenAI) AND image.b64 (Claude/Gemini),
-            -- so ANY selected provider works off the same image.
-            local previewImage = {
-                kind = transport.kind, data = transport.data,
-                width = transport.width, height = transport.height,
-            }
-            http.attachImage(previewImage)
-            local det, ierr = provider.identify(previewImage, ctx)
-
-            -- RE-validate (defence in depth). A degrade {bird_present=false} is valid.
-            local previewResult, verr = nil, nil
-            if det ~= nil then
-                local vok, vmsg = contract.validateResponse(det)
-                if vok then previewResult = det else verr = tostring(vmsg) end
             else
-                verr = tostring(ierr)
-            end
-
-            if previewResult == nil then
-                results[#results + 1] = {
-                    photoKey      = photoKey,
-                    photo         = photo,
-                    response      = nil,
-                    error         = verr or 'identify-failed',
-                    existingNames = catalogWriter.readExistingNames(photo),
-                }
-                log.info("identify produced no usable response (skipping; run continues)", {
-                    runId = runId, atIndex = i, file = file, reason = verr or 'identify-failed',
-                })
-                return
-            end
-
-            -- ---- OPT-IN EXPERIMENTAL PER-DETECTION CROP PASS -----------------
-            -- Only when cropActive AND a bird is present AND the crop tool validates.
-            local finalResult = previewResult
-            if cropActive
-                and previewResult.bird_present
-                and type(previewResult.detections) == 'table'
-                and #previewResult.detections > 0 then
-
-                local toolOk = false
-                local okTool, toolWhy = cropper.validateToolPath(prefs.imageToolPath)
-                toolOk = okTool and true or false
-                if not toolOk then
-                    log.info("crop tool unavailable (skipping crop pass; using preview)", {
-                        runId = runId, atIndex = i, file = file, reason = tostring(toolWhy),
+                local exportPath, eerr = cropper.exportFullRes(photo, runId, atIndex)
+                if not exportPath then
+                    log.warn("export failed (degrading to preview; run continues)", {
+                        runId = runId, atIndex = atIndex, file = file, reason = tostring(eerr),
                     })
                 else
-                    -- Export the full-res frame ONCE per photo (crop input + exact ref dims).
-                    local exportPath, eerr = cropper.exportFullRes(photo, runId, i)
-                    if not exportPath then
-                        log.warn("export failed (degrading to preview; run continues)", {
-                            runId = runId, atIndex = i, file = file, reason = tostring(eerr),
+                    local exportW, exportH = cropper.exportDims(exportPath)
+                    if not exportW then
+                        log.warn("export dims unreadable (degrading to preview)", {
+                            runId = runId, atIndex = atIndex, file = file, reason = tostring(exportH),
                         })
                     else
-                        local exportW, exportH = cropper.exportDims(exportPath)
-                        if not exportW then
-                            log.warn("export dims unreadable (degrading to preview)", {
-                                runId = runId, atIndex = i, file = file, reason = tostring(exportH),
-                            })
-                        else
-                            local cropPerDetection = {}
-                            for di, d in ipairs(previewResult.detections) do
-                                local rect, rerr = bboxTransform.transform(
-                                    d.bbox, exportW, exportH, { maxEdge = maxCropEdge })
-                                if not rect then
-                                    cropsSkipped = cropsSkipped + 1
-                                    log.warn("bbox transform failed (keeping preview detection)", {
-                                        runId = runId, atIndex = i, detection = di,
-                                        file = file, reason = tostring(rerr),
+                        local cropPerDetection = {}
+                        for di, d in ipairs(previewResult.detections) do
+                            local rect, rerr = bboxTransform.transform(
+                                d.bbox, exportW, exportH, { maxEdge = maxCropEdge })
+                            if not rect then
+                                log.warn("bbox transform failed (keeping preview detection)", {
+                                    runId = runId, atIndex = atIndex, detection = di,
+                                    file = file, reason = tostring(rerr),
+                                })
+                            else
+                                local cropPath, crErr = cropper.runCrop(
+                                    prefs.imageToolPath, exportPath, rect,
+                                    runId, di, file, maxCropEdge)
+                                if not cropPath then
+                                    log.info("crop step degraded (keeping preview detection)", {
+                                        runId = runId, atIndex = atIndex, detection = di,
+                                        file = file, reason = tostring(crErr),
                                     })
                                 else
-                                    local cropPath, crErr = cropper.runCrop(
-                                        prefs.imageToolPath, exportPath, rect,
-                                        runId, di, file, maxCropEdge)
-                                    if not cropPath then
-                                        cropsSkipped = cropsSkipped + 1
-                                        log.info("crop step degraded (keeping preview detection)", {
-                                            runId = runId, atIndex = i, detection = di,
-                                            file = file, reason = tostring(crErr),
-                                        })
-                                    else
-                                        -- Re-query the SAME provider on the crop (kind='file').
-                                        local cropImage = {
-                                            kind   = 'file',
-                                            path   = cropPath,
-                                            width  = rect.w,
-                                            height = rect.h,
-                                        }
-                                        http.attachImage(cropImage)
-                                        local cropResp, cqErr = provider.identify(cropImage, ctx)
-                                        local refined
-                                        if cropResp ~= nil then
-                                            local cvok, cvmsg = contract.validateResponse(cropResp)
-                                            if cvok and cropResp.bird_present
-                                                and type(cropResp.detections) == 'table'
-                                                and cropResp.detections[1] ~= nil then
-                                                refined = cropResp.detections[1]
-                                            else
-                                                log.info("crop re-query unusable (keeping preview)", {
-                                                    runId = runId, atIndex = i, detection = di,
-                                                    file = file, reason = tostring(cvmsg),
-                                                })
-                                            end
+                                    -- Re-query the SAME provider on the crop (kind='file'). NOTE: in
+                                    -- the feature branch this re-query is itself a provider call; the
+                                    -- worker_gate's per-call token+shouldStop gate wraps identifyFn,
+                                    -- which is THIS function — the first/outermost provider call is
+                                    -- gated by the driver; the crop re-query shares the same breaker
+                                    -- (the provider records it) so a latch still defers subsequent runs.
+                                    local cropImage = {
+                                        kind = 'file', path = cropPath,
+                                        width = rect.w, height = rect.h,
+                                    }
+                                    http.attachImage(cropImage)
+                                    local cropResp, cqErr = provider.identify(cropImage, ctx)
+                                    local refined
+                                    if cropResp ~= nil then
+                                        local cvok, cvmsg = contract.validateResponse(cropResp)
+                                        if cvok and cropResp.bird_present
+                                            and type(cropResp.detections) == 'table'
+                                            and cropResp.detections[1] ~= nil then
+                                            refined = cropResp.detections[1]
                                         else
-                                            log.info("crop re-query returned no response", {
-                                                runId = runId, atIndex = i, detection = di,
-                                                file = file, reason = tostring(cqErr),
+                                            log.info("crop re-query unusable (keeping preview)", {
+                                                runId = runId, atIndex = atIndex, detection = di,
+                                                file = file, reason = tostring(cvmsg),
                                             })
                                         end
-
-                                        if refined ~= nil then
-                                            cropPerDetection[di] = refined
-                                            cropsRun = cropsRun + 1
-                                        else
-                                            cropsSkipped = cropsSkipped + 1
-                                        end
+                                    else
+                                        log.info("crop re-query returned no response", {
+                                            runId = runId, atIndex = atIndex, detection = di,
+                                            file = file, reason = tostring(cqErr),
+                                        })
+                                    end
+                                    if refined ~= nil then
+                                        cropPerDetection[di] = refined
                                     end
                                 end
                             end
-
-                            -- PER-DETECTION merge: retains ALL preview detections; replaces one
-                            -- only when its confident-rank refinement >= the preview's.
-                            finalResult = merge.merge(previewResult, cropPerDetection, threshold)
                         end
+                        finalResult = merge.merge(previewResult, cropPerDetection, threshold)
                     end
                 end
             end
-
-            results[#results + 1] = {
-                photoKey      = photoKey,
-                photo         = photo,
-                response      = finalResult,
-                error         = nil,
-                existingNames = catalogWriter.readExistingNames(photo),
-            }
-            processed = processed + 1
-
-            log.info("identified", {
-                runId = runId, atIndex = i, file = file,
-                bird_present = finalResult.bird_present,
-                detections = (finalResult.detections and #finalResult.detections) or 0,
-            })
-        end)
-
-        if not ok then
-            errors = errors + 1
-            -- Append an error result so the pure writeplan counts this photo as an error.
-            results[#results + 1] = {
-                photoKey      = photoKey,
-                photo         = photo,
-                response      = nil,
-                error         = tostring(err),
-                existingNames = {},
-            }
-            log.error("photo processing failed (isolated; run continues)", {
-                runId = runId, atIndex = i, error = tostring(err),
-            })
         end
 
-        -- ---- Run-level breaker: defer the remainder after a sustained outage ----
-        if breaker.shouldStop() then
-            local remaining = n - i
-            if remaining > 0 then
-                deferred = remaining
-                log.warn("breaker open -- deferring remaining photos (run-level cooldown)", {
-                    runId = runId, atIndex = i, deferred = deferred,
-                    breaker = breaker.state().consecutive,
+        return finalResult, nil
+    end
+
+    -- ---- COLLECT PHASE (entirely OUTSIDE any write gate) ----------------------
+    local results      = {}
+    local wasCancelled = false
+    local deferred     = 0    -- photos skipped after the breaker opened / deferred clusters.
+    local cancelledCnt = 0    -- photos cancelled (feature branch reports this; serial folds into break).
+
+    if featuresOff then
+        -- =======================================================================
+        -- DEFAULT-SAFE HARD BYPASS — the EXISTING serial loop, VERBATIM. NO feature module is
+        -- required or called here (orchestrate.featuresOff guaranteed all features are off).
+        -- =======================================================================
+        for i, photo in ipairs(photos) do
+            if cancelled(progress) then
+                wasCancelled = true
+                log.info("cancelled by user", { runId = runId, atIndex = i, total = n })
+                break
+            end
+
+            progress:setPortionComplete(i - 1, n)
+            progress:setCaption(string.format("Photo %d of %d", i, n))
+
+            local photoKey = tostring(photo)
+
+            local ok, errOrResp = LrTasks.pcall(function()
+                local resp, ierr = identifyOnePhoto(photo, i)
+                if resp == nil then
+                    results[#results + 1] = {
+                        photoKey = photoKey, photo = photo, response = nil,
+                        error = ierr or 'identify-failed',
+                        existingNames = catalogWriter.readExistingNames(photo),
+                    }
+                    return
+                end
+                results[#results + 1] = {
+                    photoKey = photoKey, photo = photo, response = resp, error = nil,
+                    existingNames = catalogWriter.readExistingNames(photo),
+                }
+                log.info("identified", {
+                    runId = runId, atIndex = i, file = photoName(photo),
+                    bird_present = resp.bird_present,
+                    detections = (resp.detections and #resp.detections) or 0,
+                })
+            end)
+
+            if not ok then
+                results[#results + 1] = {
+                    photoKey = photoKey, photo = photo, response = nil,
+                    error = tostring(errOrResp), existingNames = {},
+                }
+                log.error("photo processing failed (isolated; run continues)", {
+                    runId = runId, atIndex = i, error = tostring(errOrResp),
                 })
             end
-            break
-        end
 
-        -- ---- Inter-photo rate limit (sleep AFTER each photo EXCEPT the last) ----
-        if i < n then
-            if cancelled(progress) then
-                wasCancelled = true
-                log.info("cancelled before inter-photo wait", { runId = runId, atIndex = i })
+            -- ---- Run-level breaker: defer the remainder after a sustained outage ----
+            if breaker.shouldStop() then
+                local remaining = n - i
+                if remaining > 0 then
+                    deferred = remaining
+                    log.warn("breaker open -- deferring remaining photos (run-level cooldown)", {
+                        runId = runId, atIndex = i, deferred = deferred,
+                        breaker = breaker.state().consecutive,
+                    })
+                end
                 break
             end
-            if type(rateLimit) == 'number' and rateLimit > 0 then
-                LrTasks.sleep(rateLimit)
+
+            -- ---- Inter-photo rate limit (sleep AFTER each photo EXCEPT the last) ----
+            if i < n then
+                if cancelled(progress) then
+                    wasCancelled = true
+                    log.info("cancelled before inter-photo wait", { runId = runId, atIndex = i })
+                    break
+                end
+                if type(rateLimit) == 'number' and rateLimit > 0 then
+                    LrTasks.sleep(rateLimit)
+                end
+                if cancelled(progress) then
+                    wasCancelled = true
+                    log.info("cancelled after inter-photo wait", { runId = runId, atIndex = i })
+                    break
+                end
             end
-            if cancelled(progress) then
-                wasCancelled = true
-                log.info("cancelled after inter-photo wait", { runId = runId, atIndex = i })
-                break
+
+            LrTasks.yield()   -- cooperative: keep the UI responsive.
+        end
+    else
+        -- =======================================================================
+        -- FEATURE BRANCH (some Phase-9 feature is ON). LAZY-require the feature modules ONLY
+        -- here so the bypass never loads them.
+        -- =======================================================================
+        local tokenBucket = require 'src.net.token_bucket'
+        local clusterGroup = require 'src.cluster.group'
+        local jpegThumb = require 'src.cluster.jpeg_thumb'
+        local similarity = require 'src.cluster.similarity'
+        local resultsMod = require 'src.results'
+        local workerPool = require 'src.lr.worker_pool'
+        local stackReader = require 'src.lr.stack_reader'
+        local vizReport = require 'src.lr.viz_report'
+
+        -- (0) RUN-START SWEEPS: the report orphan-sweep runs UNCONDITIONALLY (should-fix E) —
+        -- NOT gated on showDetectionReport — mirroring the crop sweep, so prior report-enabled
+        -- runs' dirs cannot leak across later report-disabled runs.
+        pcall(function() vizReport.sweepOrphans(runId) end)
+
+        -- (1) OPTIONAL cluster pre-pass + photoByKey (always built for the adapter).
+        local framing = orchestrate.buildFrames({
+            photos      = photos,
+            photoKeyOf  = tostring,
+            timeEpochOf = function(p) return stackReader.captureTimeEpoch(p) end,
+            stackIdOf   = function(p)
+                if prefs.clusterBursts ~= true then return nil end
+                return stackReader.stackId(p)
+            end,
+        })
+        local photoByKey = framing.photoByKey
+        local selection = framing.selection
+
+        local anchors, followerToAnchor
+        if prefs.clusterBursts == true then
+            -- Per-photo >=128px thumbnail -> PURE DC-luma 8x8 grid, cached by key. A nil grid =>
+            -- not similar (no merge), the SAFE direction. Guarded per-photo; never aborts the run.
+            local gridByKey = {}
+            for i = 1, #photos do
+                local photo = photos[i]
+                local key = tostring(photo)
+                local file = photoName(photo)
+                local okFetch, bytes = LrTasks.pcall(function()
+                    return previewFetch.fetchThumbBytes(photo, 128, {
+                        isCanceled = function() return cancelled(progress) end,
+                        file = file, runId = runId,
+                    })
+                end)
+                if okFetch and type(bytes) == 'string' and bytes ~= '' then
+                    local okGrid, grid = pcall(function() return jpegThumb.dcLumaGrid(bytes) end)
+                    if okGrid then gridByKey[key] = grid end
+                end
+                -- Log the stack-key probe (token-free) so the live Task-12 pass reveals real keys.
+                local okProbe, probe = pcall(function() return stackReader.probe(photo) end)
+                if okProbe and type(probe) == 'table' and type(probe.keysWithValues) == 'table'
+                    and #probe.keysWithValues > 0 then
+                    log.info("stack-key probe (clustering)", {
+                        runId = runId, atIndex = i, file = file,
+                        stackKeys = table.concat(probe.keysWithValues, ","),
+                    })
+                end
             end
+
+            local sim = function(prevKey, curKey)
+                return similarity.similar(gridByKey[prevKey], gridByKey[curKey],
+                    prefs.clusterSimilarityThreshold)
+            end
+            local grp = clusterGroup.group(framing.frames, {
+                maxGapSeconds = prefs.clusterMaxGapSeconds,
+                useStacks     = prefs.clusterUseStacks,
+                sim           = sim,
+            })
+            anchors = grp.anchors
+            followerToAnchor = grp.followerToAnchor
+        else
+            -- Clustering off (but another feature on): every photo is its own anchor.
+            anchors = {}
+            for i = 1, #selection do anchors[#anchors + 1] = selection[i] end
+            followerToAnchor = {}
         end
 
-        LrTasks.yield()   -- cooperative: keep the UI responsive.
+        log.info("cluster pre-pass done", {
+            runId = runId, total = n, anchors = #anchors,
+            followers = (function() local c = 0; for _ in pairs(followerToAnchor) do c = c + 1 end; return c end)(),
+            clustering = prefs.clusterBursts,
+        })
+
+        -- (2) DISPATCH the ANCHORS via the pool. The token bucket gates EVERY provider call
+        -- (capacity=1, no bursting). rate = 1/rateLimit tokens/sec (rateLimit<=0 => unlimited).
+        local rate = (type(rateLimit) == 'number' and rateLimit > 0) and (1 / rateLimit) or 0
+        local bucket = tokenBucket.new({ rate = rate, capacity = 1, now0 = 0 })
+
+        -- identifyFn for an anchor key -> (response, err). Look up the Lr handle from photoByKey;
+        -- the worker_gate wraps THIS call with the per-call token + after-token shouldStop gate.
+        local function identifyFn(anchorKey)
+            local photo = photoByKey[anchorKey]
+            if photo == nil then return nil, 'no-photo-for-anchor' end
+            return identifyOnePhoto(photo, anchorKey)
+        end
+
+        local poolOut = workerPool.run({
+            items          = anchors,
+            maxConcurrency = prefs.maxConcurrency,
+            bucket         = bucket,
+            breaker        = breaker,
+            identifyFn     = identifyFn,
+            onCollect      = function() end,   -- responseByAnchorKey is the canonical store.
+            progress       = progress,
+            isCanceled     = function() return cancelled(progress) end,
+            pcall          = LrTasks.pcall,
+            runId          = runId,
+        })
+
+        -- (3) BUILD PER-PHOTO RESULTS — consume worker_pool.run's RETURN (blocker A).
+        local resModel = resultsMod.build({
+            selection        = selection,
+            anchors          = anchors,
+            followerToAnchor = followerToAnchor,
+            anchorStatus     = poolOut.statusByAnchorKey,
+            anchorResponse   = poolOut.responseByAnchorKey,
+        })
+
+        -- (3b) RESULTS->WRITEPLAN ADAPTER (blocker B) — PER-PHOTO existingNames, NEVER inherited.
+        -- The read runs OUTSIDE the write gate (a catalog read), wrapped so a throwing read
+        -- degrades that photo to empty-existing rather than aborting.
+        local adapter = orchestrate.buildAdapterEntries({
+            ordered    = resModel.ordered,
+            photoByKey = photoByKey,
+            readExistingNames = function(handle)
+                local ok, names = LrTasks.pcall(function()
+                    return catalogWriter.readExistingNames(handle)
+                end)
+                return (ok and type(names) == 'table') and names or {}
+            end,
+        })
+        results  = adapter.entries
+        deferred = adapter.deferred
+        cancelledCnt = adapter.cancelled
+        if cancelledCnt > 0 then wasCancelled = true end
+
+        log.info("collect done (feature branch)", {
+            runId = runId, total = n, identified = adapter.identified,
+            deferred = adapter.deferred, cancelled = adapter.cancelled, errored = adapter.errored,
+        })
+
+        -- (5) OPTIONAL DETECTION REPORT (showDetectionReport, NOT dry-run). Post-collect, OUTSIDE
+        -- the gate. The orphan-sweep already ran UNCONDITIONALLY at step 0 -- do NOT re-sweep here.
+        -- Guarded per photo; never blocks the run; cancel-aware.
+        if prefs.showDetectionReport == true and prefs.dryRun ~= true then
+            local repIdx = 0
+            for ei = 1, #adapter.entries do
+                if cancelled(progress) then break end
+                local entry = adapter.entries[ei]
+                local resp = entry.response
+                if type(resp) == 'table' and type(resp.detections) == 'table'
+                    and #resp.detections > 0 then
+                    repIdx = repIdx + 1
+                    local photo = entry.photo
+                    local file = photoName(photo)
+                    -- Re-fetch the small preview bytes + dims for the report (OUTSIDE the gate).
+                    pcall(function()
+                        local transport = previewFetch.fetch(photo, maxEdge, {
+                            isCanceled = function() return cancelled(progress) end,
+                            file = file, runId = runId,
+                        })
+                        local bytes, fw, fh
+                        if type(transport) == 'table' then
+                            bytes = transport.data; fw = transport.width; fh = transport.height
+                        end
+                        vizReport.writeAndOpen({
+                            runId = runId, idx = repIdx, previewBytes = bytes,
+                            frameW = fw, frameH = fh, response = resp, prefs = prefs, file = file,
+                        })
+                    end)
+                end
+            end
+        end
     end
 
     -- ---- PLAN (pure) ----------------------------------------------------------
@@ -520,18 +710,15 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
 
     local bstate = breaker.state()
     -- [CODEX #N1] HONEST counts: report the AUTHORITATIVE per-run summary from writeplan
-    -- (found / identified / uncertain / errors / skipped). The loop-local `processed`
-    -- counter undercounted (it incremented only on a fully-completed body, so a photo whose
-    -- preview/identify failed showed processed=0 while errors=1). We surface perRun.* as the
-    -- single source of truth and keep `photos` == the photos the writeplan actually tallied,
-    -- so the line cannot self-contradict. Token-free: only counts + flags.
+    -- (found / identified / uncertain / errors / skipped). Token-free: only counts + flags.
     log.info("run finished", {
         runId = runId, total = n, photos = perRun.photos,
-        cancelled = wasCancelled, deferred = deferred,
+        cancelled = wasCancelled, deferred = deferred, cancelledPhotos = cancelledCnt,
         breakerOpen = bstate.open, breakerConsecutive = bstate.consecutive,
         found = perRun.found, identified = perRun.identified, uncertain = perRun.uncertain,
         errors = perRun.errors, skipped = perRun.skipped,
-        cropsRun = cropsRun, cropsSkipped = cropsSkipped,
+        featuresOff = featuresOff, maxConcurrency = prefs.maxConcurrency,
+        clusterBursts = prefs.clusterBursts, showDetectionReport = prefs.showDetectionReport,
         dryRun = report.dryRun, writeResult = writeResult, logFile = logPath,
     })
 
@@ -547,6 +734,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         .. "\nwriteResult: " .. tostring(writeResult)
         .. "  |  breaker open: " .. tostring(bstate.open)
         .. "  |  deferred: " .. tostring(deferred)
+        .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
         .. (wasCancelled and "  (cancelled)" or "")
         .. (cropNote and ("\n\nNote: " .. tostring(cropNote)) or "")
         .. "\n\nDetails are in the BirdAID log:\n" .. logPath

@@ -304,6 +304,94 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 },
             },
         },
+
+        -- 09-01 (Phase 9 — Throughput / Cluster / Viz): the three greenlit v1.0 features, all OFF/
+        -- serial by default so today's behavior is unchanged. Each control binds EXPLICITLY to prefs
+        -- (bind_to_object = prefs) so the value persists. NO secrets in this section.
+        {
+            title    = "BirdAID - Throughput & clustering",
+            synopsis = "Parallel requests and burst/stack clustering (all OFF/serial by default).",
+
+            f:row {
+                f:static_text { title = "Max parallel requests:", width = 180 },
+                f:edit_field {
+                    value = bind { key = 'maxConcurrency', bind_to_object = prefs },
+                    width_in_chars = 6,
+                    immediate = false,
+                },
+            },
+            f:row {
+                f:static_text {
+                    title = "1 = serial (default); higher (up to 50) runs N requests in parallel. " ..
+                            "Keep this conservative when the rate limit is 0 (unlimited), since " ..
+                            "the aggregate request rate is then bounded only by this count.",
+                    width_in_chars = 60,
+                    height_in_lines = 3,
+                },
+            },
+
+            f:row {
+                f:checkbox {
+                    title = "Cluster bursts (identify one anchor per near-duplicate group)",
+                    value = bind { key = 'clusterBursts', bind_to_object = prefs },
+                },
+            },
+            f:row {
+                f:static_text { title = "Max gap (seconds):", width = 180 },
+                f:edit_field {
+                    value = bind { key = 'clusterMaxGapSeconds', bind_to_object = prefs },
+                    width_in_chars = 6,
+                    immediate = false,
+                },
+            },
+            f:row {
+                f:checkbox {
+                    title = "Also cluster photos in the same Lightroom stack",
+                    value = bind { key = 'clusterUseStacks', bind_to_object = prefs },
+                },
+            },
+            f:row {
+                f:static_text { title = "Similarity threshold:", width = 180 },
+                f:edit_field {
+                    value = bind { key = 'clusterSimilarityThreshold', bind_to_object = prefs },
+                    width_in_chars = 6,
+                    immediate = false,
+                },
+            },
+            f:row {
+                f:static_text {
+                    title = "Hamming distance 0..64 over an 8x8 average-hash; LOWER = stricter " ..
+                            "(fewer merges). Clustering transfers ONE identification across " ..
+                            "near-duplicate frames (a cost/correctness tradeoff, OFF by default). " ..
+                            "If the anchor fails OR a sustained outage trips the breaker, the WHOLE " ..
+                            "burst is deferred and retried on the next run (no keywords are written).",
+                    width_in_chars = 60,
+                    height_in_lines = 5,
+                },
+            },
+        },
+
+        {
+            title    = "BirdAID - Detection report",
+            synopsis = "Optionally open a per-photo detection report in your browser (OFF by default).",
+
+            f:row {
+                f:checkbox {
+                    title = "Open a detection report in your browser after the run",
+                    value = bind { key = 'showDetectionReport', bind_to_object = prefs },
+                },
+            },
+            f:row {
+                f:static_text {
+                    title = "When on, BirdAID writes a self-contained SVG (the preview with blue " ..
+                            "detection boxes, labels, and a per-box hover tooltip) to a temporary " ..
+                            "file and opens it in your default browser. The image stays on your " ..
+                            "machine; nothing extra is sent to the AI. OFF by default.",
+                    width_in_chars = 60,
+                    height_in_lines = 4,
+                },
+            },
+        },
     }
 end
 
