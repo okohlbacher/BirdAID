@@ -502,3 +502,101 @@ assert_eq(S.reconcileModel("claude", ""), "claude-opus-4-8",
     "reconcileModel('claude','') -> claude default (empty model)")
 assert_eq(S.reconcileModel("openai", nil), "gpt-4o",
     "reconcileModel('openai',nil) -> openai default (nil model)")
+
+-- =====================================================================
+-- 09-01 Task 1: the six NEW throughput/cluster/viz prefs.
+-- DEFAULTS present + correctly typed.
+-- =====================================================================
+assert_eq(S.DEFAULTS.maxConcurrency, 1, "default maxConcurrency is 1 (serial)")
+assert_eq(S.DEFAULTS.clusterBursts, false, "default clusterBursts is false (OFF)")
+assert_eq(S.DEFAULTS.clusterMaxGapSeconds, 1.0, "default clusterMaxGapSeconds is 1.0")
+assert_eq(S.DEFAULTS.clusterUseStacks, true, "default clusterUseStacks is true")
+assert_eq(S.DEFAULTS.clusterSimilarityThreshold, 10,
+    "default clusterSimilarityThreshold is 10 (Hamming 0..64)")
+assert_eq(S.DEFAULTS.showDetectionReport, false, "default showDetectionReport is false (OFF)")
+
+-- maxConcurrency: integer, clamp 1..50, floors floats, NaN/string/negative -> 1.
+assert_eq(S.validate("maxConcurrency", 4), 4, "maxConcurrency 4 kept")
+assert_eq(type(S.validate("maxConcurrency", 4)), "number", "maxConcurrency is a number")
+assert_eq(S.validate("maxConcurrency", "3.9"), 3, "maxConcurrency '3.9' floored to 3")
+assert_eq(S.validate("maxConcurrency", 3.9), 3, "maxConcurrency 3.9 floored to 3")
+assert_eq(S.validate("maxConcurrency", 0), 1, "maxConcurrency 0 clamps up to 1")
+assert_eq(S.validate("maxConcurrency", -5), 1, "maxConcurrency -5 clamps up to 1")
+assert_eq(S.validate("maxConcurrency", 50), 50, "maxConcurrency 50 kept (hi bound)")
+assert_eq(S.validate("maxConcurrency", 999), 50, "maxConcurrency 999 clamps to 50")
+assert_eq(S.validate("maxConcurrency", "garbage"), 1, "maxConcurrency garbage -> default 1")
+assert_eq(S.validate("maxConcurrency", 0/0), 1, "maxConcurrency NaN -> default 1")
+assert_eq(S.validate("maxConcurrency", 1.0), 1, "maxConcurrency 1.0 floored stays 1")
+
+-- clusterMaxGapSeconds: number, clamp 0..30, default 1.0.
+assert_eq(S.validate("clusterMaxGapSeconds", 2.5), 2.5, "clusterMaxGapSeconds 2.5 kept")
+assert_eq(S.validate("clusterMaxGapSeconds", "1.5"), 1.5, "clusterMaxGapSeconds '1.5' coerced")
+assert_eq(S.validate("clusterMaxGapSeconds", -1), 0, "clusterMaxGapSeconds -1 clamps to 0")
+assert_eq(S.validate("clusterMaxGapSeconds", 100), 30, "clusterMaxGapSeconds 100 clamps to 30")
+assert_eq(S.validate("clusterMaxGapSeconds", "nope"), 1.0, "clusterMaxGapSeconds garbage -> 1.0")
+assert_eq(S.validate("clusterMaxGapSeconds", 0/0), 1.0, "clusterMaxGapSeconds NaN -> 1.0")
+
+-- clusterSimilarityThreshold: integer Hamming, clamp 0..64, floors, default 10.
+assert_eq(S.validate("clusterSimilarityThreshold", 12), 12, "clusterSimilarityThreshold 12 kept")
+assert_eq(S.validate("clusterSimilarityThreshold", "8.7"), 8,
+    "clusterSimilarityThreshold '8.7' floored to 8")
+assert_eq(S.validate("clusterSimilarityThreshold", -3), 0,
+    "clusterSimilarityThreshold -3 clamps to 0")
+assert_eq(S.validate("clusterSimilarityThreshold", 64), 64,
+    "clusterSimilarityThreshold 64 kept (hi bound)")
+assert_eq(S.validate("clusterSimilarityThreshold", 100), 64,
+    "clusterSimilarityThreshold 100 clamps to 64")
+assert_eq(S.validate("clusterSimilarityThreshold", "garbage"), 10,
+    "clusterSimilarityThreshold garbage -> default 10")
+assert_eq(S.validate("clusterSimilarityThreshold", 0/0), 10,
+    "clusterSimilarityThreshold NaN -> default 10")
+assert_eq(type(S.validate("clusterSimilarityThreshold", 12)), "number",
+    "clusterSimilarityThreshold is a number")
+
+-- the three NEW boolean keys fail-closed through toBool.
+do
+    local newBoolKeys = { "clusterBursts", "clusterUseStacks", "showDetectionReport" }
+    for _, k in ipairs(newBoolKeys) do
+        assert_eq(S.validate(k, "false"), false, "validate(" .. k .. ", 'false') -> false")
+        assert_eq(S.validate(k, "off"), false, "validate(" .. k .. ", 'off') -> false")
+        assert_eq(S.validate(k, "0"), false, "validate(" .. k .. ", '0') -> false")
+        assert_eq(S.validate(k, ""), false, "validate(" .. k .. ", '') -> false")
+        assert_eq(S.validate(k, "  "), false, "validate(" .. k .. ", whitespace) -> false")
+        assert_eq(S.validate(k, true), true, "validate(" .. k .. ", true) -> true")
+        assert_eq(S.validate(k, "true"), true, "validate(" .. k .. ", 'true') -> true")
+        assert_eq(type(S.validate(k, "false")), "boolean",
+            "validate(" .. k .. ", 'false') is a real boolean")
+    end
+end
+
+-- normalizedPrefs surfaces all six new keys correctly typed.
+do
+    local np = S.normalizedPrefs(nil)  -- nil rawPrefs -> typed DEFAULTS copy
+    assert_eq(np.maxConcurrency, 1, "normalizedPrefs(nil) maxConcurrency default 1")
+    assert_eq(type(np.maxConcurrency), "number", "normalizedPrefs maxConcurrency is number")
+    assert_eq(np.clusterBursts, false, "normalizedPrefs(nil) clusterBursts default false")
+    assert_eq(type(np.clusterBursts), "boolean", "normalizedPrefs clusterBursts is boolean")
+    assert_eq(np.clusterMaxGapSeconds, 1.0, "normalizedPrefs(nil) clusterMaxGapSeconds default 1.0")
+    assert_eq(type(np.clusterMaxGapSeconds), "number", "normalizedPrefs clusterMaxGapSeconds number")
+    assert_eq(np.clusterUseStacks, true, "normalizedPrefs(nil) clusterUseStacks default true")
+    assert_eq(type(np.clusterUseStacks), "boolean", "normalizedPrefs clusterUseStacks is boolean")
+    assert_eq(np.clusterSimilarityThreshold, 10,
+        "normalizedPrefs(nil) clusterSimilarityThreshold default 10")
+    assert_eq(type(np.clusterSimilarityThreshold), "number",
+        "normalizedPrefs clusterSimilarityThreshold number")
+    assert_eq(np.showDetectionReport, false, "normalizedPrefs(nil) showDetectionReport default false")
+    assert_eq(type(np.showDetectionReport), "boolean", "normalizedPrefs showDetectionReport boolean")
+
+    -- a rawPrefs with stringy values is coerced/clamped through normalizedPrefs.
+    local np2 = S.normalizedPrefs({
+        maxConcurrency = "8.9", clusterBursts = "true", clusterMaxGapSeconds = "200",
+        clusterUseStacks = "off", clusterSimilarityThreshold = "70", showDetectionReport = "1",
+    })
+    assert_eq(np2.maxConcurrency, 8, "normalizedPrefs maxConcurrency '8.9' floored to 8")
+    assert_eq(np2.clusterBursts, true, "normalizedPrefs clusterBursts 'true' -> true")
+    assert_eq(np2.clusterMaxGapSeconds, 30, "normalizedPrefs clusterMaxGapSeconds '200' clamps 30")
+    assert_eq(np2.clusterUseStacks, false, "normalizedPrefs clusterUseStacks 'off' -> false")
+    assert_eq(np2.clusterSimilarityThreshold, 64,
+        "normalizedPrefs clusterSimilarityThreshold '70' clamps 64")
+    assert_eq(np2.showDetectionReport, true, "normalizedPrefs showDetectionReport '1' -> true")
+end

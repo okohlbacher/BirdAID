@@ -162,6 +162,19 @@ M.DEFAULTS = {
                                   -- Absoluteness/leading-dash/existence are enforced in the GLUE
                                   -- at exec time (06-02 CROP-02), NOT here — settings only coerces.
     maxCropEdge         = 2048,   -- longest-edge cap for the re-query crop (mirrors previewSize)
+    -- 09-01 (Phase 9 — Throughput/Cluster/Viz): three greenlit v1.0 features, all OFF/serial
+    -- by default so today's behavior is unchanged.
+    -- BL-06 — configurable parallel AI requests via a cooperative worker pool.
+    maxConcurrency      = 1,      -- integer 1..50; DEFAULT 1 = the existing serial code path.
+    -- BL-07 — burst/stack clustering: ONE anchor per cluster identifies; followers inherit.
+    clusterBursts       = false,  -- DEFAULT OFF (serial-equivalent default-safe HARD bypass).
+    clusterMaxGapSeconds = 1.0,   -- number 0..30 sec; max inter-frame gap to time-cluster.
+    clusterUseStacks    = true,   -- DEFAULT ON: same LrC stack also clusters (when clusterBursts).
+    -- clusterSimilarityThreshold is a 0..64 HAMMING DISTANCE over the 8x8 (64-bit) average-hash
+    -- used by similarity.lua / jpeg_thumb.lua; a LOWER number = STRICTER (fewer merges).
+    clusterSimilarityThreshold = 10,
+    -- BL-04 — opt-in pure-Lua SVG detection report opened in the browser.
+    showDetectionReport = false,  -- DEFAULT OFF (default-safe HARD bypass).
 }
 
 -- =====================================================================
@@ -208,15 +221,41 @@ local function clampNumber(v, lo, hi, default)
     return n
 end
 
+-- 09-01: clampInt — like clampNumber but FLOORS to an integer first (math.floor) so a count /
+-- a Hamming distance is never fractional. NaN/non-number/inf route to the default. clampNumber
+-- alone does NOT floor, so maxConcurrency/clusterSimilarityThreshold need this distinct branch.
+-- Order matters: floor BEFORE clamping so e.g. 3.9 -> 3 (not 3.9), and the clamp keeps integers.
+local function clampInt(v, lo, hi, default)
+    local n = tonumber(v)
+    if type(n) ~= "number" then return default end
+    if n ~= n then return default end   -- NaN guard (NaN ~= NaN)
+    if n == 1 / 0 or n == -1 / 0 then return default end  -- inf guard (floor(inf) is inf)
+    n = math.floor(n)
+    if n < lo then return lo end
+    if n > hi then return hi end
+    return n
+end
+
 function M.validate(key, value)
     if key == "confidenceThreshold" then return clampNumber(value, 0, 1, 0.6) end
     if key == "previewSize" then return clampNumber(value, 512, 8192, 2048) end
     if key == "rateLimit" then return clampNumber(value, 0, 60, 1.0) end
     -- 06-01: maxCropEdge clamps to the same sane bounds as previewSize (512..8192), default 2048.
     if key == "maxCropEdge" then return clampNumber(value, 512, 8192, 2048) end
+    -- 09-01: BL-06 maxConcurrency is an INTEGER count 1..50 default 1 (floored, never fractional).
+    if key == "maxConcurrency" then return clampInt(value, 1, 50, 1) end
+    -- 09-01: BL-07 clusterMaxGapSeconds is a number 0..30 sec default 1.0.
+    if key == "clusterMaxGapSeconds" then return clampNumber(value, 0, 30, 1.0) end
+    -- 09-01: BL-07 clusterSimilarityThreshold is an INTEGER Hamming distance over the 64-bit aHash,
+    -- 0..64 default 10 (range pinned to the 64-cell hash so similarity.lua / jpeg_thumb.lua agree).
+    if key == "clusterSimilarityThreshold" then return clampInt(value, 0, 64, 10) end
     if key == "sendGpsDate" or key == "usePathHint"
         or key == "dryRun" or key == "singleKeywordPerPhoto"
-        or key == "cropEnabled" then
+        or key == "cropEnabled"
+        -- 09-01: BL-07/BL-04 booleans, fail-closed via toBool (clusterUseStacks defaults TRUE; a nil
+        -- rawPrefs substitutes the DEFAULTS value BEFORE validate, so the true default survives).
+        or key == "clusterBursts" or key == "clusterUseStacks"
+        or key == "showDetectionReport" then
         -- 04-02: ALL boolean keys go through the shared fail-closed parser. (Retroactively
         -- fixes sendGpsDate/usePathHint: the old `value and true or false` let a string
         -- "false" through, because every non-empty string is truthy in Lua.)
