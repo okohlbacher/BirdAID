@@ -27,6 +27,42 @@ what the AI was and was not sure of, rather than receiving a silent wrong answer
 
 ---
 
+## Requirements — you bring your own AI
+
+BirdAID does **not** include or bundle an AI model. The actual species identification is done by a
+**vision-capable AI** that you connect with your **own API key**. To run BirdAID you need:
+
+- **Adobe Lightroom Classic** on **macOS** (v1 is macOS-only).
+- An **API key** from one of the supported AI providers below — a paid account, billed per use
+  (typically a fraction of a cent to a few cents per photo, depending on provider, model, and
+  image size).
+- _(Optional)_ **ImageMagick**, only if you enable the experimental crop-for-ID pass.
+
+**Why bring your own key?** It keeps *you* in control of cost, model choice, and data. Your key is
+stored only in the **macOS Keychain** — never in the plug-in's preferences or logs — and each image
+goes directly from Lightroom to the provider you chose. There is no BirdAID server in the middle.
+
+> A key needs **available quota/credit.** A key with no credit returns an authentication/quota
+> error, which BirdAID surfaces clearly (rather than silently reporting "no birds found").
+
+## Supported AI providers
+
+Choose a provider and model in **Plug-in Manager → BirdAID** settings:
+
+| Provider | Default model | Where to get a key | Notes |
+|---|---|---|---|
+| **OpenAI** _(default)_ | `gpt-4o` | platform.openai.com | Fully verified end-to-end. Strict JSON Structured Outputs. |
+| **Anthropic Claude** | a vision Claude model | console.anthropic.com | Same interface; forced tool-use JSON. |
+| **Google Gemini** | a vision Gemini model | aistudio.google.com | Same interface; native bounding boxes. |
+
+All three run the **same** pipeline and produce the same flat `English name (Latin name)` keywords —
+switching providers requires no other change. You can also enter a **custom model** name if your
+account has access to one that isn't in the built-in list. See the
+**[Providers Reference](providers.md)** for auth headers, request/response shapes, and guidance on
+choosing.
+
+---
+
 ## Features
 
 - **One-click identification** — select photos in LrC, run
@@ -74,6 +110,8 @@ pass is present but off by default pending spike verification.
 - [Architecture](architecture.md) — contributor reference: the pure/Lr separation
   invariant, the provider interface, the require shim, the test runner, and how to add
   a new provider backend.
+- [BirdAID and cloud Lightroom](lightroom-cloud.md) — why BirdAID is Lightroom **Classic**-only,
+  and what the cloud Lightroom API can (and cannot) do.
 - [CONTRIBUTING](../CONTRIBUTING.md) — dev setup, test conventions, the CODEX
   adversarial gate, GSD workflow, and the no-secrets rule.
-- [GitHub repository](https://github.com/okohlbacher/BirdAID) _(link TBD)_
+- [GitHub repository](https://github.com/okohlbacher/BirdAID)
