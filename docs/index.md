@@ -39,7 +39,7 @@ BirdAID does **not** include or bundle an AI model. The actual species identific
   image size).
 
 **Why bring your own key?** It keeps *you* in control of cost, model choice, and data. Your key is
-stored only in the OS **Keychain** — never in the plug-in's preferences or logs — and each image
+stored only in the OS **keychain** (Keychain on macOS, Credential Manager on Windows) — never in the plug-in's preferences or logs — and each image
 goes directly from Lightroom to the provider you chose. There is no BirdAID server in the middle.
 
 > **⚠️ Privacy:** to identify a photo, BirdAID uploads a **downsampled JPEG preview** of it (never
@@ -77,7 +77,7 @@ choosing.
 - **Add-only write-back** — never removes, renames, or replaces your existing keywords.
   Re-running on the same photos is always safe.
 - **Three vision-AI providers** — OpenAI (default, `gpt-4o`), Claude (Anthropic),
-  and Gemini (Google). You supply your own API key, stored only in the OS keychain.
+  and Gemini (Google). You supply your own API key, stored only in the OS keychain (Keychain on macOS, Credential Manager on Windows).
 - **GPS + date regional prior** — passes coordinates and capture date to the AI to
   narrow the candidate species list. ON by default; can be turned off in settings.
 - **Privacy-first logging** — the logging sink redacts API keys, GPS coordinates,

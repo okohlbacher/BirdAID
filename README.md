@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![CI](https://github.com/okohlbacher/BirdAID/actions/workflows/ci.yml/badge.svg)](https://github.com/okohlbacher/BirdAID/actions/workflows/ci.yml)
-![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
+![Platform: macOS | Windows](https://img.shields.io/badge/platform-macOS%20%7C%20Windows-lightgrey.svg)
 
 **Automatically identify and keyword the birds in your Lightroom Classic library.**
 

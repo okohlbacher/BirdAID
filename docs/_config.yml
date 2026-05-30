@@ -1,6 +1,6 @@
 title: BirdAID
 description: >-
-  A macOS plug-in for Adobe Lightroom Classic that identifies bird species
+  a macOS + Windows plug-in for Adobe Lightroom Classic that identifies bird species
   in your photos using vision AI and writes the results back as keywords.
 
 remote_theme: pages-themes/cayman@v0.2.0
