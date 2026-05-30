@@ -108,6 +108,101 @@ assert_eq(jt.dcLumaGrid(string.char(0xFF, 0xD8, 0xFF, 0xC0, 0, 0)), nil,
     "SOI + truncated SOF -> nil (no raise)")
 
 -- =====================================================================
+-- SOS / SOF malformation -> fail-open to nil (no raise). These mutate the VALID gray fixture
+-- (a single-component baseline, so SOS = FFDA, len=8, ns=1, then [cs,td_ta], then Ss,Se,AhAl).
+-- =====================================================================
+
+-- locate the byte offset (1-based) of the first 0xFFDA (SOS) marker in a JPEG string, or nil.
+local function findSOS(s)
+    local i = 1
+    while i < #s do
+        if s:byte(i) == 0xFF and s:byte(i + 1) == 0xDA then return i end
+        i = i + 1
+    end
+    return nil
+end
+
+-- replace the single byte at 1-based position `pos` of string `s` with byte `val`.
+local function patch(s, pos, val)
+    return s:sub(1, pos - 1) .. string.char(val) .. s:sub(pos + 1)
+end
+
+do
+    local raw = F.gray_sceneC
+    assert_true(type(jt.dcLumaGrid(raw)) == 'table', "control: gray fixture decodes before mutation")
+
+    local sos = findSOS(raw)
+    assert_true(sos ~= nil, "found the SOS marker in the gray fixture")
+    -- SOS layout from `sos`: FF DA | lenHi lenLo | ns | [cs td_ta]*ns | Ss Se AhAl
+    -- gray fixture: ns == 1, so Ss is at sos+5, Se at sos+6, AhAl at sos+7 (0-based from FF at sos).
+    local nsPos   = sos + 4
+    local ns      = raw:byte(nsPos)
+    assert_eq(ns, 1, "gray fixture scan has ns=1")
+    local ssPos   = nsPos + 1 + ns * 2   -- after ns and the ns component pairs.
+    local sePos   = ssPos + 1
+    local ahalPos = ssPos + 2
+
+    -- mutate spectral selection 0,63,0 -> 1,1,1 (a progressive-style partial scan) => nil.
+    local mut1 = patch(patch(patch(raw, ssPos, 1), sePos, 1), ahalPos, 1)
+    assert_eq(jt.dcLumaGrid(mut1), nil, "SOS spectral bytes 1,1,1 (not 0,63,0) => nil")
+    -- Ss alone non-zero => nil.
+    assert_eq(jt.dcLumaGrid(patch(raw, ssPos, 1)), nil, "SOS Ss != 0 => nil")
+    -- Se alone not 63 => nil.
+    assert_eq(jt.dcLumaGrid(patch(raw, sePos, 62)), nil, "SOS Se != 63 => nil")
+    -- AhAl non-zero (successive approximation) => nil.
+    assert_eq(jt.dcLumaGrid(patch(raw, ahalPos, 0x11)), nil, "SOS AhAl != 0 => nil")
+
+    -- bad SOS length: len must be EXACTLY 6 + 2*ns (==8 here). Bump lenLo => nil.
+    local badLen = patch(raw, sos + 3, raw:byte(sos + 3) + 2)
+    assert_eq(jt.dcLumaGrid(badLen), nil, "SOS declared length != 6+2*ns => nil")
+end
+
+-- SOF1 (extended sequential) and SOF9 (arithmetic) are NOT baseline SOF0 => nil. Mutate the
+-- gray fixture's SOF0 marker byte (0xFFC0) to 0xC1 / 0xC9.
+do
+    local raw = F.gray_sceneC
+    -- find the SOF0 marker (0xFFC0).
+    local sof = nil
+    local i = 1
+    while i < #raw do
+        if raw:byte(i) == 0xFF and raw:byte(i + 1) == 0xC0 then sof = i; break end
+        i = i + 1
+    end
+    assert_true(sof ~= nil, "found the SOF0 marker in the gray fixture")
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC1)), nil, "SOF1 (extended sequential) => nil")
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC9)), nil, "SOF9 (arithmetic) => nil")
+    assert_eq(jt.dcLumaGrid(patch(raw, sof + 1, 0xC2)), nil, "SOF2 (progressive) => nil")
+end
+
+-- An invalid / empty Huffman table (DHT with all-zero counts -> buildHuff returns nil) => nil, no raise.
+do
+    -- a minimal JPEG: SOI, a DHT whose 16 BITS counts are ALL ZERO (empty table) -> reject.
+    local s = string.char(
+        0xFF, 0xD8,                      -- SOI
+        0xFF, 0xC4, 0x00, 0x13,          -- DHT, len = 19 (2 + 1 + 16)
+        0x00,                            -- Tc/Th = 0 (DC table 0)
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  -- 16 all-zero counts (empty)
+    )
+    assert_eq(jt.dcLumaGrid(s), nil, "empty/invalid Huffman table (all-zero DHT) => nil (no raise)")
+end
+
+-- A broken restart sequence: a baseline frame declaring DRI=1 but with NO RSTn marker where one is
+-- required degrades to nil (decode hits the missing-marker path) -- proven via a truncated scan that
+-- carries a DRI. We reuse the valid gray fixture and INSERT a DRI (FFDD 0004 0001) right before SOS,
+-- then truncate the scan so the expected restart marker is absent => nil, no raise.
+do
+    local raw = F.gray_sceneC
+    local sos = findSOS(raw)
+    assert_true(sos ~= nil, "found SOS for restart-sequence test")
+    -- splice a DRI segment (restart interval = 1 MCU) just before the SOS marker.
+    local dri = string.char(0xFF, 0xDD, 0x00, 0x04, 0x00, 0x01)
+    local withDri = raw:sub(1, sos - 1) .. dri .. raw:sub(sos)
+    -- truncate a few bytes off the end so the restart marker the decoder expects is missing.
+    local broken = withDri:sub(1, #withDri - 4)
+    assert_eq(jt.dcLumaGrid(broken), nil, "broken restart sequence (missing RSTn) => nil (no raise)")
+end
+
+-- =====================================================================
 -- Determinism: same bytes -> identical grid (distance 0 across two decodes).
 -- =====================================================================
 do

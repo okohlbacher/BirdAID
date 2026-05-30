@@ -224,8 +224,12 @@ local function decode(bytes)
             if width <= 0 or height <= 0 then return nil end
             frame = { width = width, height = height, comps = comps }
             i = i + len
-        elseif marker == 0xC2 or marker == 0xC3 or (marker >= 0xC5 and marker <= 0xCF and marker ~= 0xC8) then
-            -- progressive (C2), lossless (C3), arithmetic (C9..), other non-baseline SOF -> reject.
+        elseif (marker >= 0xC1 and marker <= 0xCF and marker ~= 0xC4 and marker ~= 0xC8 and marker ~= 0xCC) then
+            -- Any SOF that is NOT baseline SOF0 (0xC0) -> reject. This covers SOF1 (extended
+            -- sequential, 0xC1), SOF2 (progressive), SOF3 (lossless), SOF5-7 (differential),
+            -- SOF9-15 (arithmetic). 0xC4 = DHT, 0xC8 = JPG (reserved), 0xCC = DAC are NOT SOFs
+            -- and are handled elsewhere / skipped; every other 0xC1..0xCF marker is a non-baseline
+            -- SOF and MUST fail-open (a wrong merge is worse than a missed merge).
             return nil
         elseif marker == 0xC4 then
             -- DHT: one or more tables.
@@ -271,7 +275,14 @@ local function decode(bytes)
             local len = b(bytes, i) * 256 + b(bytes, i + 1)
             if len < 6 or i + len > n + 1 then return nil end
             local ns = b(bytes, i + 2)
+            -- BASELINE-SCAN SHAPE: ns must match the frame's component count, the segment length
+            -- must be EXACTLY 6 + 2*ns, and the three trailing spectral-selection / successive-
+            -- approximation bytes (Ss, Se, AhAl) must describe a full baseline DC+AC scan:
+            -- Ss == 0, Se == 63, Ah == 0 AND Al == 0 (the AhAl byte == 0). Anything else is a
+            -- progressive / partial scan and MUST fail-open (a wrong merge is worse than a missed one).
             if ns < 1 or ns > #frame.comps then return nil end
+            if ns ~= #frame.comps then return nil end
+            if len ~= 6 + 2 * ns then return nil end
             -- map each scan component to (dcTableId, acTableId) and to its frame component.
             local scan = {}
             for s = 1, ns do
@@ -288,6 +299,12 @@ local function decode(bytes)
                 if not fc then return nil end
                 scan[s] = { fc = fc, dcId = dcId, acId = acId }
             end
+            -- the three spectral-selection bytes follow the ns component pairs.
+            local spo = i + 3 + ns * 2
+            local ss   = b(bytes, spo)
+            local se   = b(bytes, spo + 1)
+            local ahal = b(bytes, spo + 2)
+            if ss ~= 0 or se ~= 63 or ahal ~= 0 then return nil end
             -- scan data begins after the SOS header (i + len). Build the bit reader.
             local scanStart = i + len
             return { frame = frame, dcTables = dcTables, acTables = acTables,
