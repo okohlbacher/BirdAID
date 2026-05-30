@@ -285,7 +285,11 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     -- ungated provider.identify call. A crop-call 'cancelled'/'deferred' MUST propagate (we abort
     -- the per-photo identify with that reason) -- it is NEVER silently downgraded to an ungated call.
     -- ===========================================================================
-    local function identifyOnePhoto(photo, atIndex, cropGate)
+    -- fetchJob(photo, atIndex) -> { image, ctx, file } | (nil, reason). The MAIN-TASK, SERIAL
+    -- preview fetch + metadata shaping, DECOUPLED from the provider call. The parallel path runs
+    -- this on the orchestrator's task (never from N worker coroutines), so it never issues
+    -- concurrent requestJpegThumbnail renders — which time out under load (the stress-test bug).
+    local function fetchJob(photo, atIndex)
         local file = photoName(photo)
 
         -- ---- Preview fetch -------------------------------------------------
@@ -306,12 +310,25 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local ctx = metadata.shape(raw, rawPrefs)
         ctx.runId = runId
 
-        -- ---- LIVE identify on the preview (generic provider) -------------
+        -- ---- Build the transport image (provider-agnostic) ---------------
         local previewImage = {
             kind = transport.kind, data = transport.data,
             width = transport.width, height = transport.height,
         }
         http.attachImage(previewImage)
+        return { image = previewImage, ctx = ctx, file = file }
+    end
+
+    -- identifyAfterFetch(job, atIndex, cropGate) -> (response, err). Everything AFTER the preview
+    -- fetch: the provider call on the preview + the optional EXPERIMENTAL crop pass. In the parallel
+    -- path the CONSUMER wraps this call in the worker_gate (token + after-token cancel/breaker); in
+    -- the serial bypass identifyOnePhoto calls it directly (cropGate=nil) — byte-for-byte as before.
+    local function identifyAfterFetch(job, atIndex, cropGate)
+        local file = job.file
+        local ctx = job.ctx
+        local previewImage = job.image
+
+        -- ---- LIVE identify on the preview (generic provider) -------------
         local det, ierr = provider.identify(previewImage, ctx)
 
         -- RE-validate (defence in depth). A degrade {bird_present=false} is valid.
@@ -438,6 +455,16 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         end
 
         return finalResult, nil
+    end
+
+    -- identifyOnePhoto(photo, atIndex, cropGate): SERIAL composition (fetch on this task, then
+    -- identify). Used by the default-safe bypass loop — byte-for-byte the prior behavior. The
+    -- parallel path does NOT use this; it calls fetchJob on the main task and identifyAfterFetch
+    -- in a gated worker (so previews are never fetched concurrently).
+    local function identifyOnePhoto(photo, atIndex, cropGate)
+        local job, reason = fetchJob(photo, atIndex)
+        if job == nil then return nil, reason end
+        return identifyAfterFetch(job, atIndex, cropGate)
     end
 
     -- ---- COLLECT PHASE (entirely OUTSIDE any write gate) ----------------------
