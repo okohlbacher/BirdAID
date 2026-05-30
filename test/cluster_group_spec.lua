@@ -155,15 +155,34 @@ end
 
 -- =====================================================================
 -- nil-time frame is NEVER time-clustered (only stack-clustered when applicable).
+-- After the deterministic (timeEpoch ASC, selIndex ASC) sort, finite-time frames are grouped
+-- among themselves and nil-time frames sort LAST and can never join the time branch. With
+-- a(0.0), c(0.1), and a nil-time b: a & c are within the window and merge ({a,c}); b sorts last
+-- as its own anchor. So two clusters total, and b is NEVER a time-follower.
 -- =====================================================================
 do
     local frames = {
         { key = 'a', timeEpoch = 0.0, stackId = nil, selIndex = 1 },
-        { key = 'b', timeEpoch = nil, stackId = nil, selIndex = 2 },  -- nil time, no stack -> new anchor
-        { key = 'c', timeEpoch = 0.1, stackId = nil, selIndex = 3 },  -- prev (b) has nil time -> new anchor
+        { key = 'b', timeEpoch = nil, stackId = nil, selIndex = 2 },  -- nil time, no stack -> own anchor (sorts last)
+        { key = 'c', timeEpoch = 0.1, stackId = nil, selIndex = 3 },  -- merges with a after sort
     }
     local r = group.group(frames, { maxGapSeconds = 1.0, useStacks = true })
-    assert_eq(#r.anchors, 3, "nil-time frames break the time branch on both sides")
+    assert_eq(#r.anchors, 2, "nil-time frame sorts last as its own anchor; finite-time a,c merge")
+    assert_eq(r.anchors[1], 'a', "first anchor is a (earliest finite time)")
+    assert_eq(r.followerToAnchor['c'], 'a', "c merges with a (time-adjacent after sort)")
+    assert_eq(r.followerToAnchor['b'], nil, "nil-time b is its own anchor, never a time-follower")
+end
+
+-- =====================================================================
+-- A nil-time frame with NO stack genuinely never time-clusters: two nil-time frames stay separate.
+-- =====================================================================
+do
+    local frames = {
+        { key = 'a', timeEpoch = nil, stackId = nil, selIndex = 1 },
+        { key = 'b', timeEpoch = nil, stackId = nil, selIndex = 2 },
+    }
+    local r = group.group(frames, { maxGapSeconds = 1.0, useStacks = true })
+    assert_eq(#r.anchors, 2, "two nil-time, no-stack frames never merge (time branch needs finite times)")
 end
 
 -- =====================================================================
@@ -192,6 +211,71 @@ do
     }
     local r = group.group(frames, { maxGapSeconds = 1.0 })  -- no sim
     assert_eq(#r.anchors, 1, "nil sim = always similar -> merged on time alone")
+end
+
+-- =====================================================================
+-- B2: UNSORTED input is grouped IDENTICALLY to the same frames sorted by (timeEpoch, selIndex).
+-- group.build sorts internally, so shuffling the input must not change the partition.
+-- =====================================================================
+do
+    local sorted = {
+        { key = 'a', timeEpoch = 0.0, selIndex = 1 },
+        { key = 'b', timeEpoch = 0.3, selIndex = 2 },  -- merges with a
+        { key = 'c', timeEpoch = 5.0, selIndex = 3 },  -- new anchor
+        { key = 'd', timeEpoch = 5.2, selIndex = 4 },  -- merges with c
+    }
+    local shuffled = {
+        { key = 'd', timeEpoch = 5.2, selIndex = 4 },
+        { key = 'a', timeEpoch = 0.0, selIndex = 1 },
+        { key = 'c', timeEpoch = 5.0, selIndex = 3 },
+        { key = 'b', timeEpoch = 0.3, selIndex = 2 },
+    }
+    local rs = group.group(sorted,   { maxGapSeconds = 1.0 })
+    local ru = group.group(shuffled, { maxGapSeconds = 1.0 })
+    assert_eq(#rs.anchors, 2, "sorted input -> 2 clusters")
+    assert_eq(#ru.anchors, 2, "shuffled input -> SAME 2 clusters")
+    assert_eq(ru.anchors[1], rs.anchors[1], "same first anchor regardless of input order (a)")
+    assert_eq(ru.anchors[2], rs.anchors[2], "same second anchor regardless of input order (c)")
+    assert_eq(ru.followerToAnchor['b'], 'a', "b -> a after internal sort (was out of order)")
+    assert_eq(ru.followerToAnchor['d'], 'c', "d -> c after internal sort (was out of order)")
+end
+
+-- =====================================================================
+-- B2: a NEGATIVE time delta NEVER merges. Even if a caller passes an earlier frame after a later
+-- one (and we defeat the sort by giving them equal selIndex won't help) -- the internal sort puts
+-- the earlier-time frame first, and the lower-bound (delta >= 0) guard means no earlier frame ever
+-- folds into a later anchor. Construct a pair where, pre-sort, cur is BEFORE prev in time.
+-- =====================================================================
+do
+    -- input order: later-time first, earlier-time second (an "unsorted" descending pair).
+    local frames = {
+        { key = 'late',  timeEpoch = 10.0, selIndex = 1 },
+        { key = 'early', timeEpoch = 0.0,  selIndex = 2 },  -- 10s before -> never adjacent
+    }
+    local r = group.group(frames, { maxGapSeconds = 1.0 })
+    -- after sort: early(0.0) then late(10.0); gap 10 >= 1 -> two anchors. A negative delta is never
+    -- even evaluated (sort fixes order) AND would be rejected by delta>=0 if it were.
+    assert_eq(#r.anchors, 2, "descending-time input never merges into a single cluster")
+    assert_eq(r.anchors[1], 'early', "earliest-time frame is the first anchor after sort")
+    assert_eq(r.followerToAnchor['late'], nil, "the later frame never merges backward")
+end
+
+-- =====================================================================
+-- B2: EQUAL timeEpoch ties break by selIndex ASC (deterministic, total ordering).
+-- =====================================================================
+do
+    -- three frames at the SAME instant, given out of selIndex order; the window is wide so all merge,
+    -- and the FIRST anchor must be the lowest-selIndex frame after the tie-break sort.
+    local frames = {
+        { key = 'z', timeEpoch = 100.0, selIndex = 3 },
+        { key = 'x', timeEpoch = 100.0, selIndex = 1 },
+        { key = 'y', timeEpoch = 100.0, selIndex = 2 },
+    }
+    local r = group.group(frames, { maxGapSeconds = 1.0 })
+    assert_eq(#r.anchors, 1, "equal-time frames within the window merge into one cluster")
+    assert_eq(r.anchors[1], 'x', "the lowest-selIndex frame (x) is the anchor after the tie-break")
+    assert_eq(r.followerToAnchor['y'], 'x', "y follows x")
+    assert_eq(r.followerToAnchor['z'], 'x', "z follows x")
 end
 
 -- =====================================================================

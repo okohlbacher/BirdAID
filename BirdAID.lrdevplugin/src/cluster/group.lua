@@ -50,21 +50,63 @@ function M.group(frames, opts)
     local useStacks = opts.useStacks
     local sim = opts.sim   -- function(prevKey,curKey)->bool, or nil = "always similar"
 
-    local prev = nil       -- the previous frame table
-    local anchorKey = nil  -- the current cluster's anchor key
-
+    -- DETERMINISTIC SORT (robustness against unsorted input): order by (timeEpoch ASC, selIndex ASC).
+    -- Frames with a NIL / non-finite timeEpoch sort AFTER all finite-time frames and are ordered
+    -- among themselves by selIndex; they can NEVER be time-adjacent (the time branch already requires
+    -- BOTH endpoints finite). selIndex ties / nil-selIndex fall back to the original input index so
+    -- the comparator is total and stable. We sort a copy of the valid frames (table + non-nil key).
+    local sorted = {}
     for i = 1, #frames do
         local cur = frames[i]
         if type(cur) == 'table' and cur.key ~= nil then
+            sorted[#sorted + 1] = { frame = cur, origIndex = i }
+        end
+    end
+    local function selOr(f)
+        return finite(f.selIndex) and f.selIndex or nil
+    end
+    table.sort(sorted, function(ea, eb)
+        local a, bb = ea.frame, eb.frame
+        local ta, tb = finite(a.timeEpoch), finite(bb.timeEpoch)
+        if ta ~= tb then
+            -- finite time sorts before nil/non-finite time.
+            return ta
+        end
+        if ta and tb and a.timeEpoch ~= bb.timeEpoch then
+            return a.timeEpoch < bb.timeEpoch
+        end
+        -- equal (or both-nil) time: break by selIndex ASC (nil selIndex sorts last among ties).
+        local sa, sb = selOr(a), selOr(bb)
+        if sa ~= nil and sb ~= nil and sa ~= sb then
+            return sa < sb
+        end
+        if (sa ~= nil) ~= (sb ~= nil) then
+            return sa ~= nil   -- a frame WITH selIndex sorts before one without.
+        end
+        -- fully tied: fall back to original input order for a stable, total comparator.
+        return ea.origIndex < eb.origIndex
+    end)
+
+    local prev = nil       -- the previous frame table
+    local anchorKey = nil  -- the current cluster's anchor key
+
+    for i = 1, #sorted do
+        local cur = sorted[i].frame
+        do
             if prev == nil then
                 -- First frame: always a new anchor.
                 anchors[#anchors + 1] = cur.key
                 anchorKey = cur.key
             else
-                -- time-adjacent only when BOTH timeEpochs are finite numbers (nil-time never merges).
+                -- time-adjacent only when BOTH timeEpochs are finite numbers (nil-time never merges)
+                -- AND the delta is in [0, maxGap): a NEGATIVE delta (cur before prev) NEVER merges,
+                -- so even pathologically unsorted input cannot fold an earlier frame into a later
+                -- anchor. After the deterministic sort above the delta is normally >= 0; the explicit
+                -- lower bound is belt-and-suspenders robustness.
                 local timeAdjacent = false
                 if finite(prev.timeEpoch) and finite(cur.timeEpoch) then
-                    timeAdjacent = (cur.timeEpoch - prev.timeEpoch) < maxGap
+                    local delta = cur.timeEpoch - prev.timeEpoch
+                    timeAdjacent = (delta >= 0) and (delta < maxGap)
                 end
 
                 -- stack-same only when useStacks AND both stackId present AND equal.
