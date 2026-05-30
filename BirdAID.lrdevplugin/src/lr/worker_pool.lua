@@ -230,7 +230,12 @@ function M.run(opts)
                     -- The body delegates to the PURE gate which returns (status, response, err); on a
                     -- THROW (throwing identify/sleep) ypcall reports ok=false and a is the error.
                     local ok, a, b, c = ypcall(function() return workerBody(item) end)
-                    local status, response = classify(item, ok, a, b, c)
+                    -- classify normalizes BOTH outcomes into (status, response, errMsg). The errMsg
+                    -- is the token-free provider error string the gate produced on a 'fatal' (gate's
+                    -- 3rd return), or the isolated THROW's tostring(err) when ypcall reports ok=false.
+                    -- It MUST be threaded to onCollect/the log — the raw ypcall return `b` is the
+                    -- gate's RESPONSE (nil on a fatal), NOT the error (regression cc60990 dropped it).
+                    local status, response, errMsg = classify(item, ok, a, b, c)
                     -- Record the terminal outcome into the PURE controller (frees the slot).
                     pool.onResult(item, status)
                     if status == 'identified' and response ~= nil then
@@ -241,7 +246,7 @@ function M.run(opts)
                         if status == 'identified' then
                             onCollect(item, response, nil)
                         elseif status == 'fatal' then
-                            onCollect(item, nil, b)
+                            onCollect(item, nil, errMsg)   -- token-free provider error string.
                         else
                             onCollect(item, nil, nil)   -- deferred/cancelled: no response, no error.
                         end
