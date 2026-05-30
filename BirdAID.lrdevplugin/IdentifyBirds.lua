@@ -5,7 +5,7 @@
 -- Birds in Selected Photos...". This is the REAL end-to-end pipeline for the USER'S
 -- SELECTED provider (openai / claude / gemini): it runs
 --   settings -> http.buildDeps(prefs.provider) -> providers.get(prefs.provider, deps)
---   -> per-photo (preview + metadata + identify [+ optional EXPERIMENTAL crop])
+--   -> per-photo (preview + metadata + identify)
 --   -> writeplan.planReport -> dry-run-log OR a single batched catalog_writer.apply.
 --
 -- It hangs off the proven lifecycle:
@@ -16,7 +16,7 @@
 --     checked at the TOP of every iteration (and around the inter-photo wait).
 --   * Isolates per-photo failures with LrTasks.pcall so a failing photo never aborts the
 --     run; tracks HONEST processed/errors/cancelled/deferred counters.
---   * Guarantees progress:done() (and the crop-dir cleanup) runs on normal completion,
+--   * Guarantees progress:done() runs on normal completion,
 --     cancel, AND unexpected error via context:addCleanupHandler.
 --
 -- ===========================================================================
@@ -30,7 +30,7 @@
 -- Only on the FEATURE branch (some feature on) does the orchestrator:
 --   (0) sweep prior reports UNCONDITIONALLY at run start (mirrors the crop orphan-sweep);
 --   (1) optional cluster pre-pass (clusterBursts) -> anchors + follower->anchor map;
---   (2) dispatch ANCHORS via worker_pool.run (shared capacity-1 token bucket + breaker), CONSUME
+--   (2) dispatch ANCHORS via the staged pool (serial preview fetch + parallel gated AI), CONSUME
 --       its returned { statusByAnchorKey, responseByAnchorKey };
 --   (3) results.build -> one per-photo result for EVERY selected photo;
 --   (3b) results->writeplan ADAPTER (photoKey->handle + PER-PHOTO existingNames, NEVER inherited);
@@ -41,13 +41,13 @@
 -- PROVIDER (generic, multi-provider): deps are built ONCE via http.buildDeps(prefs.provider)
 -- (one Keychain read, model reconciled to the selected provider) and the provider is
 -- resolved via providers.get(prefs.provider, deps). The SAME provider instance is reused
--- for the preview identify AND every crop re-query. We deliberately avoid the
--- OpenAI-hardcoded provider constructor, which would ignore prefs.provider.
+-- for the preview identify. We deliberately avoid the OpenAI-hardcoded provider constructor,
+-- which would ignore prefs.provider.
 --
--- CROP-for-ID ships OFF by default AND is EXPERIMENTAL: it runs only when prefs.cropEnabled
--- AND platform.capabilities(osToken).crop_supported (macOS) AND the external tool validates,
--- and only after an explicit EXPERIMENTAL warning is logged (the 06-03 spike is still open).
--- Off-macOS the crop command is NEVER built; the fail-clear reason is logged + surfaced.
+-- CLOUD-NATIVE / CROSS-PLATFORM: detection (bird_present + bbox) AND species are produced by the
+-- provider from the (downsampled) preview. There is no local or full-res crop pass and no external
+-- image tool, so BirdAID runs on Windows as well as macOS. NOTE: the downsampled preview image IS
+-- uploaded to the selected third-party AI for identification.
 --
 -- This file imports Lr* (it is the orchestration entry) but it does NOT create its own
 -- logger -- ALL logging routes through the single src.log sink (single-sink invariant), and
@@ -71,7 +71,6 @@ dofile(LrPathUtils.child(_PLUGIN.path, 'birdaid_bootstrap.lua'))
 
 local log            = require 'src.log'          -- single sink; NEVER create a logger here.
 local settings       = require 'src.settings'
-local platform       = require 'src.platform'
 local contract       = require 'src.contract'
 local writeplan      = require 'src.writeplan'
 local breakerMod     = require 'src.net.breaker'
@@ -82,9 +81,6 @@ local providers      = require 'src.providers.init'    -- the GENERIC provider s
 local previewFetch   = require 'src.lr.preview_fetch'
 local metadataReader = require 'src.lr.metadata_reader'
 local catalogWriter  = require 'src.lr.catalog_writer'
-local cropper        = require 'src.lr.cropper'
-local bboxTransform  = require 'src.crop.bbox_transform'
-local merge          = require 'src.crop.merge'
 
 -- Per-invocation monotonic counter so even two newRunId() calls within the SAME fractional
 -- instant (or with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives
@@ -139,18 +135,14 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local rawPrefs    = LrPrefs.prefsForPlugin()
     local prefs       = settings.normalizedPrefs(rawPrefs)
     local maxEdge     = prefs.previewSize
-    local rateLimit   = prefs.rateLimit
-    local maxCropEdge = prefs.maxCropEdge
-    local threshold   = prefs.confidenceThreshold
 
     -- PHASE 9: the HARD default-safe bypass predicate (PURE). When true, NONE of the feature
     -- modules are required/constructed/called -- the existing serial loop runs verbatim below.
     local featuresOff = orchestrate.featuresOff(prefs)
 
-    -- Platform-capability decision (pure): MAC_ENV/WIN_ENV are LrC globals -> an OS token ->
-    -- capabilities. Off-macOS crop_supported is false with a clear, surfaceable reason.
+    -- OS token (MAC_ENV/WIN_ENV are LrC globals) for the structured run log only. Detection +
+    -- species are fully cloud-side, so BirdAID is cross-platform (no external tools / no crop).
     local osToken = MAC_ENV and 'macos' or (WIN_ENV and 'windows' or 'unknown')
-    local caps    = platform.capabilities(osToken)
 
     local catalog = LrApplication.activeCatalog()
     local photos  = catalog:getTargetPhotos()
@@ -158,8 +150,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
 
     log.info("run started", {
         runId = runId, targetPhotos = n, provider = prefs.provider, model = prefs.model,
-        rateLimit = rateLimit, previewSize = maxEdge, dryRun = prefs.dryRun,
-        cropEnabled = prefs.cropEnabled, os = osToken, logFile = logPath,
+        previewSize = maxEdge, dryRun = prefs.dryRun, os = osToken, logFile = logPath,
         -- token-free Phase-9 mode counters.
         maxConcurrency = prefs.maxConcurrency, clusterBursts = prefs.clusterBursts,
         showDetectionReport = prefs.showDetectionReport, featuresOff = featuresOff,
@@ -202,62 +193,8 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         return
     end
 
-    -- CROP GATE (EXPERIMENTAL until the 06-03 spike is closed). crop ships OFF by default.
-    -- [CODEX #3] cropActive requires the external tool to VALIDATE UP FRONT (mirrors the
-    -- Phase-6 tool-check-before-export fix in the dev crop spike entry): it is true ONLY when
-    -- prefs.cropEnabled AND the platform supports crop AND cropper.validateToolPath(...) is
-    -- OK. If the tool is missing/invalid we do NOT create the run temp dir and do NOT claim
-    -- "crop ran" — crop is inactive, the pipeline uses the preview, and the experimental
-    -- "ran" notice is NEVER falsely emitted. validateToolPath returns a token-free reason.
-    local cropPlatformOk = caps.crop_supported and true or false
-    local cropToolOk     = false
-    local cropToolWhy    = nil
-    if prefs.cropEnabled == true and cropPlatformOk then
-        local okTool, whyTool = cropper.validateToolPath(prefs.imageToolPath)
-        cropToolOk  = okTool and true or false
-        cropToolWhy = whyTool
-    end
-    local cropActive = (prefs.cropEnabled == true) and cropPlatformOk and cropToolOk
-    local cropNote   = nil   -- a token-free note surfaced in the final summary, if any.
-
-    if prefs.cropEnabled == true then
-        -- Always emit the explicit EXPERIMENTAL warning BEFORE any crop step is set up.
-        log.warn("crop-for-ID is EXPERIMENTAL/unverified (pending the 06-03 spike); macOS + a VALIDATED external crop tool only", {
-            runId = runId, os = osToken,
-        })
-        if not cropPlatformOk then
-            -- Fail clear off-macOS: log the reason, surface it, and build NO crop command.
-            cropNote = caps.crop_reason
-            log.warn("crop requested but unsupported on this platform -- skipping crop (preview only)", {
-                runId = runId, os = osToken, reason = tostring(caps.crop_reason),
-            })
-        elseif not cropToolOk then
-            -- [CODEX #3] Tool missing/invalid UP FRONT: crop is NOT active. NO temp dir, NO
-            -- false "crop ran" claim. Token-free reason (validateToolPath never leaks a path).
-            cropNote = "crop disabled: external image tool missing or invalid"
-            log.warn("crop requested but the external image tool did not validate -- skipping crop (preview only)", {
-                runId = runId, os = osToken, reason = tostring(cropToolWhy),
-            })
-        else
-            cropNote = "crop-for-ID ran in EXPERIMENTAL mode (unverified pending 06-03)"
-        end
-    end
-
-    -- Per-run owned temp dir + whole-dir cleanup on success/error/CANCEL -- ONLY when cropActive.
-    if cropActive then
-        local runDir, rderr = cropper.runDir(runId)
-        if not runDir then
-            -- Could not create the crop dir: degrade to preview-only rather than abort the run.
-            log.warn("could not create per-run crop temp dir -- continuing preview only", {
-                runId = runId, reason = tostring(rderr),
-            })
-            cropActive = false
-            cropNote = "crop disabled: could not create temp dir"
-        else
-            context:addCleanupHandler(function() cropper.cleanupRunDir(runId) end)
-            cropper.sweepOrphans(runId)   -- age-gated; deletes OTHER stale run-* dirs only.
-        end
-    end
+    -- (No crop pass: detection + species are fully cloud-side from the preview — cross-platform,
+    -- no external image tool. The previous EXPERIMENTAL macOS-only crop-for-ID was removed.)
 
     local progress = LrProgressScope({
         title           = "BirdAID: identifying birds",
@@ -269,21 +206,13 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     if progress.setCancelable then progress:setCancelable(true) end
 
     -- ===========================================================================
-    -- SHARED per-photo identify body (used by BOTH the serial bypass loop AND the
-    -- feature-branch worker_pool identifyFn). It runs preview fetch + metadata + provider
-    -- identify (+ optional crop re-query) and returns (response, nil) | (nil, err). It performs
-    -- NO catalog write (collect stays OUTSIDE the gate) and NO breaker-defer decision (the
-    -- provider owns the breaker; the serial loop reads shouldStop after; the worker_pool gate
-    -- re-reads shouldStop before each provider call). `atIndex` is for logging only.
-    --
-    -- `cropGate` (FEATURE BRANCH ONLY) routes each crop re-query provider call through the SAME
-    -- pure worker_gate.gate(...) sequence as the preview call (acquire token -> after-token
-    -- isCanceled? -> after-token breaker.shouldStop? -> else provider.identify). It is
-    -- cropGate(cropImage, ctx) -> (status, response, err) with status one of
-    -- 'identified'|'cancelled'|'deferred'|'fatal'. A nil cropGate (the DEFAULT-SAFE BYPASS path,
-    -- featuresOff) keeps today's EXACT serial crop behavior: the crop re-query is the direct,
-    -- ungated provider.identify call. A crop-call 'cancelled'/'deferred' MUST propagate (we abort
-    -- the per-photo identify with that reason) -- it is NEVER silently downgraded to an ungated call.
+    -- SHARED per-photo identify body. Split so previews are NEVER fetched concurrently:
+    --   * fetchJob(photo, atIndex)        -> the MAIN-TASK preview fetch + metadata shape -> job.
+    --   * identifyAfterFetch(job, atIndex) -> the provider call on the preview -> (response, err).
+    --   * identifyOnePhoto(photo, atIndex) -> serial composition (used by the default-safe bypass).
+    -- The parallel path runs fetchJob on the main task (serial) and identifyAfterFetch in a gated
+    -- consumer. NO catalog write here (collect stays OUTSIDE the gate) and NO breaker-defer decision
+    -- (the provider owns the breaker; the worker_gate re-reads shouldStop before the provider call).
     -- ===========================================================================
     -- fetchJob(photo, atIndex) -> { image, ctx, file } | (nil, reason). The MAIN-TASK, SERIAL
     -- preview fetch + metadata shaping, DECOUPLED from the provider call. The parallel path runs
@@ -316,20 +245,16 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             width = transport.width, height = transport.height,
         }
         http.attachImage(previewImage)
-        -- Carry the ORIGINAL Lr photo handle in the job: identifyAfterFetch needs it for the
-        -- experimental full-res crop export (cropper.exportFullRes). It is NOT sent to the AI.
-        return { image = previewImage, ctx = ctx, file = file, photo = photo }
+        return { image = previewImage, ctx = ctx, file = file }
     end
 
-    -- identifyAfterFetch(job, atIndex, cropGate) -> (response, err). Everything AFTER the preview
-    -- fetch: the provider call on the preview + the optional EXPERIMENTAL crop pass. In the parallel
-    -- path the CONSUMER wraps this call in the worker_gate (token + after-token cancel/breaker); in
-    -- the serial bypass identifyOnePhoto calls it directly (cropGate=nil) — byte-for-byte as before.
-    local function identifyAfterFetch(job, atIndex, cropGate)
+    -- identifyAfterFetch(job, atIndex) -> (response, err). The provider call on the (downsampled)
+    -- preview. In the parallel path the CONSUMER wraps this in the worker_gate (after-token
+    -- cancel/breaker); the serial bypass calls it directly. Detection + species are fully cloud-side.
+    local function identifyAfterFetch(job, atIndex)
         local file = job.file
         local ctx = job.ctx
         local previewImage = job.image
-        local photo = job.photo   -- ORIGINAL handle (for the experimental full-res crop export only)
 
         -- ---- LIVE identify on the preview (generic provider) -------------
         local det, ierr = provider.identify(previewImage, ctx)
@@ -350,124 +275,18 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             return nil, verr or 'identify-failed'
         end
 
-        -- ---- OPT-IN EXPERIMENTAL PER-DETECTION CROP PASS -----------------
-        local finalResult = previewResult
-        if cropActive
-            and previewResult.bird_present
-            and type(previewResult.detections) == 'table'
-            and #previewResult.detections > 0 then
-
-            local okTool, toolWhy = cropper.validateToolPath(prefs.imageToolPath)
-            if not (okTool and true or false) then
-                log.info("crop tool unavailable (skipping crop pass; using preview)", {
-                    runId = runId, atIndex = atIndex, file = file, reason = tostring(toolWhy),
-                })
-            else
-                local exportPath, eerr = cropper.exportFullRes(photo, runId, atIndex)
-                if not exportPath then
-                    log.warn("export failed (degrading to preview; run continues)", {
-                        runId = runId, atIndex = atIndex, file = file, reason = tostring(eerr),
-                    })
-                else
-                    local exportW, exportH = cropper.exportDims(exportPath)
-                    if not exportW then
-                        log.warn("export dims unreadable (degrading to preview)", {
-                            runId = runId, atIndex = atIndex, file = file, reason = tostring(exportH),
-                        })
-                    else
-                        local cropPerDetection = {}
-                        for di, d in ipairs(previewResult.detections) do
-                            local rect, rerr = bboxTransform.transform(
-                                d.bbox, exportW, exportH, { maxEdge = maxCropEdge })
-                            if not rect then
-                                log.warn("bbox transform failed (keeping preview detection)", {
-                                    runId = runId, atIndex = atIndex, detection = di,
-                                    file = file, reason = tostring(rerr),
-                                })
-                            else
-                                local cropPath, crErr = cropper.runCrop(
-                                    prefs.imageToolPath, exportPath, rect,
-                                    runId, di, file, maxCropEdge)
-                                if not cropPath then
-                                    log.info("crop step degraded (keeping preview detection)", {
-                                        runId = runId, atIndex = atIndex, detection = di,
-                                        file = file, reason = tostring(crErr),
-                                    })
-                                else
-                                    -- Re-query the SAME provider on the crop (kind='file').
-                                    -- FEATURE BRANCH: route the crop provider call through the SAME
-                                    -- worker_gate.gate(...) sequence as the preview call (cropGate),
-                                    -- so it acquires its own token and re-checks isCanceled/breaker.
-                                    -- shouldStop IMMEDIATELY before the call. A 'cancelled'/'deferred'
-                                    -- gate outcome PROPAGATES (aborts this photo) — it is NEVER
-                                    -- silently downgraded to an ungated provider call. BYPASS PATH
-                                    -- (cropGate==nil): EXACT today's serial ungated direct call.
-                                    local cropImage = {
-                                        kind = 'file', path = cropPath,
-                                        width = rect.w, height = rect.h,
-                                    }
-                                    http.attachImage(cropImage)
-                                    local cropResp, cqErr
-                                    if cropGate ~= nil then
-                                        local status, gResp, gErr = cropGate(cropImage, ctx)
-                                        if status == 'cancelled' or status == 'deferred' then
-                                            -- Propagate: the gate refused this provider call. Surface
-                                            -- it as the per-photo error so the driver classifies the
-                                            -- WHOLE item with this terminal reason (never an ungated
-                                            -- fall-back). 'cancelled' -> cancel; 'deferred' -> breaker.
-                                            log.info("crop re-query gate refused provider call (propagating)", {
-                                                runId = runId, atIndex = atIndex, detection = di,
-                                                file = file, reason = status,
-                                            })
-                                            return nil, status
-                                        end
-                                        -- 'identified' carries the response; 'fatal' carries gErr.
-                                        cropResp, cqErr = gResp, gErr
-                                    else
-                                        cropResp, cqErr = provider.identify(cropImage, ctx)
-                                    end
-                                    local refined
-                                    if cropResp ~= nil then
-                                        local cvok, cvmsg = contract.validateResponse(cropResp)
-                                        if cvok and cropResp.bird_present
-                                            and type(cropResp.detections) == 'table'
-                                            and cropResp.detections[1] ~= nil then
-                                            refined = cropResp.detections[1]
-                                        else
-                                            log.info("crop re-query unusable (keeping preview)", {
-                                                runId = runId, atIndex = atIndex, detection = di,
-                                                file = file, reason = tostring(cvmsg),
-                                            })
-                                        end
-                                    else
-                                        log.info("crop re-query returned no response", {
-                                            runId = runId, atIndex = atIndex, detection = di,
-                                            file = file, reason = tostring(cqErr),
-                                        })
-                                    end
-                                    if refined ~= nil then
-                                        cropPerDetection[di] = refined
-                                    end
-                                end
-                            end
-                        end
-                        finalResult = merge.merge(previewResult, cropPerDetection, threshold)
-                    end
-                end
-            end
-        end
-
-        return finalResult, nil
+        -- Cloud-native: the provider does detection + species from the (downsampled) preview. There
+        -- is no local/full-res crop pass (removed for cross-platform; ImageMagick was macOS-only).
+        return previewResult, nil
     end
 
-    -- identifyOnePhoto(photo, atIndex, cropGate): SERIAL composition (fetch on this task, then
-    -- identify). Used by the default-safe bypass loop — byte-for-byte the prior behavior. The
-    -- parallel path does NOT use this; it calls fetchJob on the main task and identifyAfterFetch
-    -- in a gated worker (so previews are never fetched concurrently).
-    local function identifyOnePhoto(photo, atIndex, cropGate)
+    -- identifyOnePhoto(photo, atIndex): SERIAL composition (fetch on this task, then identify).
+    -- Used by the default-safe bypass loop. The parallel path does NOT use this; it calls fetchJob
+    -- on the main task and identifyAfterFetch in a gated worker (so previews aren't fetched together).
+    local function identifyOnePhoto(photo, atIndex)
         local job, reason = fetchJob(photo, atIndex)
         if job == nil then return nil, reason end
-        return identifyAfterFetch(job, atIndex, cropGate)
+        return identifyAfterFetch(job, atIndex)
     end
 
     -- ---- COLLECT PHASE (entirely OUTSIDE any write gate) ----------------------
@@ -542,23 +361,6 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                 break
             end
 
-            -- ---- Inter-photo rate limit (sleep AFTER each photo EXCEPT the last) ----
-            if i < n then
-                if cancelled(progress) then
-                    wasCancelled = true
-                    log.info("cancelled before inter-photo wait", { runId = runId, atIndex = i })
-                    break
-                end
-                if type(rateLimit) == 'number' and rateLimit > 0 then
-                    LrTasks.sleep(rateLimit)
-                end
-                if cancelled(progress) then
-                    wasCancelled = true
-                    log.info("cancelled after inter-photo wait", { runId = runId, atIndex = i })
-                    break
-                end
-            end
-
             LrTasks.yield()   -- cooperative: keep the UI responsive.
         end
         end,   -- runSerial
@@ -567,8 +369,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- FEATURE BRANCH (some Phase-9 feature is ON). LAZY-require the feature modules ONLY
         -- here so the bypass never loads them.
         -- =======================================================================
-        local tokenBucket = require 'src.net.token_bucket'
-        local workerGate = require 'src.net.worker_gate'   -- PURE per-provider-call gate (crop re-query).
+        local workerGate = require 'src.net.worker_gate'   -- PURE per-provider-call gate (cancel/breaker).
         local clusterGroup = require 'src.cluster.group'
         local jpegThumb = require 'src.cluster.jpeg_thumb'
         local similarity = require 'src.cluster.similarity'
@@ -587,31 +388,11 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local photoByKey = {}
         for i = 1, #photos do photoByKey[tostring(photos[i])] = photos[i] end
 
-        -- SHARED token bucket (capacity=1; rate = 1/rateLimit tokens/sec; <=0 => unlimited) gates
-        -- EVERY provider call across all workers AND crop re-queries.
-        local rate = (type(rateLimit) == 'number' and rateLimit > 0) and (1 / rateLimit) or 0
-        local bucket = tokenBucket.new({ rate = rate, capacity = 1, now0 = 0 })
-
-        -- Wall clock for the SHARED bucket (real-time seconds, NOT CPU time), matching the pool's.
-        local function cropWallClock()
+        -- Real-time wall clock for the gate (seconds; NOT CPU time).
+        local function wallClock()
             local ok, t = pcall(function() return LrDate.currentTime() end)
             if ok and type(t) == 'number' and t == t then return t end
             return os.time()
-        end
-
-        -- Crop re-query gate: SAME worker_gate sequence as the preview call (shared bucket + breaker;
-        -- cancel WINS; breaker READ-ONLY; provider owns record). identifyOnePhoto propagates a
-        -- 'cancelled'/'deferred' gate outcome.
-        local function cropGate(cropImage, ctx)
-            return workerGate.gate({
-                item       = cropImage,
-                bucket     = bucket,
-                now        = cropWallClock,
-                sleep      = LrTasks.sleep,
-                isCanceled = function() return cancelled(progress) end,
-                breaker    = breaker,
-                identify   = function() return provider.identify(cropImage, ctx) end,
-            })
         end
 
         -- producerFetch(anchorKey) -> job | (nil, reason): MAIN-TASK serial preview fetch (the
@@ -625,26 +406,19 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             return job
         end
 
-        -- consumerIdentify(job) -> (status, response): the CONSUMER (parallel). The worker_gate
-        -- wraps the preview provider call with the per-call token + after-token cancel/breaker gate
-        -- (token now gates ONLY the provider call, not the preview fetch); crop re-queries use the
-        -- shared cropGate. Returns the gate's plain (status, response).
+        -- consumerIdentify(job) -> (status, response): the CONSUMER (parallel AI call). The
+        -- worker_gate applies the after-token cancel/breaker gate immediately before the provider
+        -- call. There is no token bucket (no rate-limit knob) -> bucket nil = unlimited; provider
+        -- 429s are handled by the provider's backoff + the run-level breaker.
         local function consumerIdentify(job)
-            local status, resp, err = workerGate.gate({
+            local status, resp = workerGate.gate({
                 item       = job,
-                bucket     = bucket,
-                now        = cropWallClock,
+                now        = wallClock,
                 sleep      = LrTasks.sleep,
                 isCanceled = function() return cancelled(progress) end,
                 breaker    = breaker,
-                identify   = function(it) return identifyAfterFetch(it, it.atIndex, cropGate) end,
+                identify   = function(it) return identifyAfterFetch(it, it.atIndex) end,
             })
-            -- A crop-gate refusal inside identifyAfterFetch returns (nil, 'cancelled'|'deferred'),
-            -- which worker_gate maps to 'fatal' with that err. Re-surface the true terminal status
-            -- so a crop-path cancel/defer is not mislabelled fatal (crop is experimental/off).
-            if status == 'fatal' and (err == 'cancelled' or err == 'deferred') then
-                return err, nil
-            end
             return status, resp
         end
 
@@ -830,7 +604,6 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         .. "  |  deferred: " .. tostring(deferred)
         .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
         .. (wasCancelled and "  (cancelled)" or "")
-        .. (cropNote and ("\n\nNote: " .. tostring(cropNote)) or "")
         .. "\n\nDetails are in the BirdAID log:\n" .. logPath
 
     local kind = (perRun.errors > 0 or writeResult == 'error' or bstate.open) and "warning" or "info"

@@ -151,20 +151,12 @@ M.DEFAULTS = {
     promptAddition      = "",
     confidenceThreshold = 0.6,    -- [0,1]; the "sortable hint" gate (CLAUDE.md bird-ID reality)
     previewSize         = 2048,   -- px max edge requested from requestJpegThumbnail
-    rateLimit           = 1.0,    -- seconds between AI calls (LrTasks.sleep, Phase 5)
     sendGpsDate         = true,   -- opt-in, DEFAULT ON  (SPEC §3, FR4)
     usePathHint         = false,  -- opt-in, DEFAULT OFF (SPEC §3, SET-04, R8)
     dryRun              = false,  -- WR-04: report the plan, write NOTHING; DEFAULT OFF
     singleKeywordPerPhoto = false,-- false = per-detection (deduped); true = keep only the single best keyword/photo
-    -- 06-01 (Phase 6 — Crop-for-ID): the opt-in crop pass + its external tool + size cap.
-    cropEnabled         = false,  -- CROP: opt-in crop-for-ID refinement, DEFAULT OFF (SPEC §3)
-    imageToolPath       = "",     -- absolute path to the external crop tool (magick); "" = unset.
-                                  -- Absoluteness/leading-dash/existence are enforced in the GLUE
-                                  -- at exec time (06-02 CROP-02), NOT here — settings only coerces.
-    maxCropEdge         = 2048,   -- longest-edge cap for the re-query crop (mirrors previewSize)
-    -- 09-01 (Phase 9 — Throughput/Cluster/Viz): three greenlit v1.0 features, all OFF/serial
-    -- by default so today's behavior is unchanged.
-    -- BL-06 — configurable parallel AI requests via a cooperative worker pool.
+    -- (Phase 9 — Throughput/Cluster/Viz): greenlit v1.0 features, all OFF/serial by default.
+    -- BL-06 — parallel AI requests via a cooperative worker pool. THE single throughput knob.
     maxConcurrency      = 1,      -- integer 1..50; DEFAULT 1 = the existing serial code path.
     -- BL-07 — burst/stack clustering: ONE anchor per cluster identifies; followers inherit.
     clusterBursts       = false,  -- DEFAULT OFF (serial-equivalent default-safe HARD bypass).
@@ -239,10 +231,7 @@ end
 function M.validate(key, value)
     if key == "confidenceThreshold" then return clampNumber(value, 0, 1, 0.6) end
     if key == "previewSize" then return clampNumber(value, 512, 8192, 2048) end
-    if key == "rateLimit" then return clampNumber(value, 0, 60, 1.0) end
-    -- 06-01: maxCropEdge clamps to the same sane bounds as previewSize (512..8192), default 2048.
-    if key == "maxCropEdge" then return clampNumber(value, 512, 8192, 2048) end
-    -- 09-01: BL-06 maxConcurrency is an INTEGER count 1..50 default 1 (floored, never fractional).
+    -- BL-06 maxConcurrency is an INTEGER count 1..50 default 1 (floored, never fractional).
     if key == "maxConcurrency" then return clampInt(value, 1, 50, 1) end
     -- 09-01: BL-07 clusterMaxGapSeconds is a number 0..30 sec default 1.0.
     if key == "clusterMaxGapSeconds" then return clampNumber(value, 0, 30, 1.0) end
@@ -251,7 +240,6 @@ function M.validate(key, value)
     if key == "clusterSimilarityThreshold" then return clampInt(value, 0, 64, 10) end
     if key == "sendGpsDate" or key == "usePathHint"
         or key == "dryRun" or key == "singleKeywordPerPhoto"
-        or key == "cropEnabled"
         -- 09-01: BL-07/BL-04 booleans, fail-closed via toBool (clusterUseStacks defaults TRUE; a nil
         -- rawPrefs substitutes the DEFAULTS value BEFORE validate, so the true default survives).
         or key == "clusterBursts" or key == "clusterUseStacks"
@@ -261,10 +249,7 @@ function M.validate(key, value)
         -- "false" through, because every non-empty string is truthy in Lua.)
         return M.toBool(value)
     end
-    if key == "provider" or key == "model" or key == "promptAddition"
-        or key == "imageToolPath" then
-        -- 06-01: imageToolPath is string-coerced ONLY here; absoluteness/leading-dash/existence
-        -- are enforced in the GLUE at exec time (06-02 CROP-02), not in settings.
+    if key == "provider" or key == "model" or key == "promptAddition" then
         return tostring(value or "")
     end
     -- Unknown key: passthrough (never raise).

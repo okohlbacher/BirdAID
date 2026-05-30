@@ -183,15 +183,6 @@ local function sectionsForTopOfDialog(f, propertyTable)
             },
 
             f:row {
-                f:static_text { title = "Rate limit (sec):", width = 140 },
-                f:edit_field {
-                    value = bind { key = 'rateLimit', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
-
-            f:row {
                 f:checkbox {
                     title = "Send GPS + capture date to the AI (improves accuracy)",
                     value = bind { key = 'sendGpsDate', bind_to_object = prefs },
@@ -210,35 +201,6 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     title = settings.DISCLOSURE_TEXT,
                     width_in_chars = 60,
                     height_in_lines = 4,
-                },
-            },
-
-            -- 06-02 (Phase 6 — Crop-for-ID): the opt-in crop pass + its external tool path.
-            -- DEFAULTS alone leaves these keys HIDDEN, so they MUST be surfaced here (CODEX #15).
-            -- Both bind EXPLICITLY to prefs so the values persist.
-            f:row {
-                f:checkbox {
-                    title = "Enable crop-for-ID refinement pass (sends a tighter crop for a second look)",
-                    value = bind { key = 'cropEnabled', bind_to_object = prefs },
-                },
-            },
-
-            f:row {
-                f:static_text { title = "Image tool path:", width = 140 },
-                f:edit_field {
-                    value = bind { key = 'imageToolPath', bind_to_object = prefs },
-                    width_in_chars = 40,
-                    immediate = false,
-                },
-            },
-
-            f:row {
-                f:static_text {
-                    title = "Absolute path to the ImageMagick 'magick' binary " ..
-                            "(e.g. /opt/homebrew/bin/magick). Required only when the crop " ..
-                            "pass is enabled; macOS-only in v1.",
-                    width_in_chars = 60,
-                    height_in_lines = 2,
                 },
             },
 
@@ -313,7 +275,7 @@ local function sectionsForTopOfDialog(f, propertyTable)
             synopsis = "Parallel requests and burst/stack clustering (all OFF/serial by default).",
 
             f:row {
-                f:static_text { title = "Max parallel requests:", width = 180 },
+                f:static_text { title = "Number of parallel requests:", width = 180 },
                 f:edit_field {
                     value = bind { key = 'maxConcurrency', bind_to_object = prefs },
                     width_in_chars = 6,
@@ -322,11 +284,13 @@ local function sectionsForTopOfDialog(f, propertyTable)
             },
             f:row {
                 f:static_text {
-                    title = "1 = serial (default); higher (up to 50) runs N requests in parallel. " ..
-                            "Keep this conservative when the rate limit is 0 (unlimited), since " ..
-                            "the aggregate request rate is then bounded only by this count.",
+                    title = "How many photos are sent to the AI at the same time (1-50). " ..
+                            "1 = one at a time (default). Higher = faster on large selections. " ..
+                            "If your AI provider rejects requests for being too fast, BirdAID " ..
+                            "automatically backs off and retries -- so just lower this number a bit. " ..
+                            "Try 4-8 to start.",
                     width_in_chars = 60,
-                    height_in_lines = 3,
+                    height_in_lines = 4,
                 },
             },
 

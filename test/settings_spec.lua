@@ -19,7 +19,6 @@ assert_eq(S.DEFAULTS.model, "gpt-4o", "default model is gpt-4o")
 assert_eq(S.DEFAULTS.promptAddition, "", "default promptAddition is empty string")
 assert_eq(S.DEFAULTS.confidenceThreshold, 0.6, "default confidenceThreshold is 0.6")
 assert_eq(S.DEFAULTS.previewSize, 2048, "default previewSize is 2048")
-assert_eq(S.DEFAULTS.rateLimit, 1.0, "default rateLimit is 1.0")
 assert_eq(S.DEFAULTS.sendGpsDate, true, "default sendGpsDate is true (opt-in DEFAULT ON)")
 assert_eq(S.DEFAULTS.usePathHint, false, "default usePathHint is false (opt-in DEFAULT OFF)")
 assert_eq(S.DEFAULTS.dryRun, false, "default dryRun is false (WR-04 report-without-write OFF)")
@@ -28,13 +27,7 @@ assert_eq(S.DEFAULTS.singleKeywordPerPhoto, false,
 
 -- =====================================================================
 -- 06-01: Phase-6 crop prefs added to DEFAULTS.
---   cropEnabled   -- opt-in crop-for-ID pass, DEFAULT OFF (SPEC §3; fail-closed boolean)
---   imageToolPath -- absolute path to the external crop tool (magick), DEFAULT ""
---   maxCropEdge   -- longest-edge cap for the re-query crop, DEFAULT 2048 (mirrors previewSize)
 -- =====================================================================
-assert_eq(S.DEFAULTS.cropEnabled, false, "default cropEnabled is false (opt-in DEFAULT OFF)")
-assert_eq(S.DEFAULTS.imageToolPath, "", "default imageToolPath is empty string")
-assert_eq(S.DEFAULTS.maxCropEdge, 2048, "default maxCropEdge is 2048 (mirrors previewSize)")
 
 -- =====================================================================
 -- 04-02: settings.toBool — SHARED fail-closed boolean parser
@@ -99,11 +92,6 @@ assert_eq(S.validate("previewSize", 100), 512, "previewSize 100 clamps to 512")
 assert_eq(S.validate("previewSize", 99999), 8192, "previewSize 99999 clamps to 8192")
 assert_eq(S.validate("previewSize", "nope"), 2048, "previewSize garbage falls back to 2048")
 
--- rateLimit [0,60] default 1.0
-assert_eq(S.validate("rateLimit", "1.0"), 1.0, "rateLimit string coerced to number")
-assert_eq(S.validate("rateLimit", -5), 0, "rateLimit -5 clamps to 0")
-assert_eq(S.validate("rateLimit", 999), 60, "rateLimit 999 clamps to 60")
-assert_eq(S.validate("rateLimit", "x"), 1.0, "rateLimit garbage falls back to 1.0")
 
 -- boolean normalization
 assert_eq(S.validate("sendGpsDate", true), true, "sendGpsDate true stays true")
@@ -119,38 +107,16 @@ assert_eq(S.validate("promptAddition", 42), "42", "promptAddition number coerces
 
 -- =====================================================================
 -- 06-01: Phase-6 crop pref validation.
---   cropEnabled routes through the SHARED fail-closed boolean parser (toBool) just like the
 --   other booleans (string "false"/numeric 0/nil -> false).
---   imageToolPath is string-coerced ONLY here; absoluteness / leading-dash / existence are
 --   ENFORCED IN THE GLUE at exec time (06-02 CROP-02), not in settings (boundary note).
---   maxCropEdge is clamped to the same sane bounds as previewSize (512..8192), default 2048.
 -- =====================================================================
--- cropEnabled fail-closed boolean
-assert_eq(S.validate("cropEnabled", "false"), false, "validate(cropEnabled,'false') -> false")
-assert_eq(S.validate("cropEnabled", "true"), true, "validate(cropEnabled,'true') -> true")
-assert_eq(S.validate("cropEnabled", nil), false, "validate(cropEnabled,nil) -> false (toBool nil)")
-assert_eq(S.validate("cropEnabled", 0), false, "validate(cropEnabled,0) -> false (fail-closed)")
-assert_eq(type(S.validate("cropEnabled", "false")), "boolean",
-    "validate(cropEnabled) returns a real boolean")
 
--- imageToolPath string coercion (NOTE: absoluteness/existence are a GLUE-tier check, 06-02)
-assert_eq(S.validate("imageToolPath", "/opt/homebrew/bin/magick"), "/opt/homebrew/bin/magick",
-    "validate(imageToolPath, abs) passes through the string")
-assert_eq(S.validate("imageToolPath", nil), "", "validate(imageToolPath, nil) -> '' (tostring(value or ''))")
-assert_eq(S.validate("imageToolPath", 42), "42", "validate(imageToolPath, number) coerces to string")
 
--- maxCropEdge clamped number
-assert_eq(S.validate("maxCropEdge", "4096"), 4096, "validate(maxCropEdge,'4096') -> number 4096")
-assert_eq(type(S.validate("maxCropEdge", "4096")), "number", "maxCropEdge coerced to number")
-assert_eq(S.validate("maxCropEdge", "99"), 512, "validate(maxCropEdge,'99') clamps to 512 (min)")
-assert_eq(S.validate("maxCropEdge", 99999), 8192, "validate(maxCropEdge,99999) clamps to 8192 (max)")
-assert_eq(S.validate("maxCropEdge", nil), 2048, "validate(maxCropEdge,nil) -> default 2048")
-assert_eq(S.validate("maxCropEdge", "garbage"), 2048, "validate(maxCropEdge garbage) -> default 2048")
 
 -- validate NEVER raises (pcall battery)
 do
     local inputs = { nil, 0, -1, 5, "0.6", "garbage", true, false, {}, 1/0, -1/0 }
-    local keys = { "confidenceThreshold", "previewSize", "rateLimit",
+    local keys = { "confidenceThreshold", "previewSize",
                    "sendGpsDate", "usePathHint", "provider", "model", "promptAddition",
                    "unknownKey" }
     for _, k in ipairs(keys) do
@@ -168,7 +134,7 @@ end
 -- SET-02: normalizedPrefs — TYPED read-through (CODEX #2)
 -- =====================================================================
 do
-    local raw = { confidenceThreshold = "0.6", previewSize = "2048", rateLimit = "1.0",
+    local raw = { confidenceThreshold = "0.6", previewSize = "2048",
                   sendGpsDate = true, usePathHint = false,
                   provider = "openai", model = "gpt-4o", promptAddition = "" }
     local n = S.normalizedPrefs(raw)
@@ -176,8 +142,6 @@ do
     assert_eq(n.confidenceThreshold, 0.6, "normalizedPrefs confidenceThreshold value 0.6")
     assert_eq(type(n.previewSize), "number", "normalizedPrefs previewSize is number")
     assert_eq(n.previewSize, 2048, "normalizedPrefs previewSize value 2048")
-    assert_eq(type(n.rateLimit), "number", "normalizedPrefs rateLimit is number")
-    assert_eq(n.rateLimit, 1.0, "normalizedPrefs rateLimit value 1.0")
     assert_eq(type(n.sendGpsDate), "boolean", "normalizedPrefs sendGpsDate is boolean")
     assert_eq(n.provider, "openai", "normalizedPrefs provider preserved")
     assert_eq(n.model, "gpt-4o", "normalizedPrefs model preserved")
@@ -255,28 +219,14 @@ end
 -- =====================================================================
 do
     local n = S.normalizedPrefs({})
-    assert_eq(n.cropEnabled, false, "normalizedPrefs({}).cropEnabled default false")
-    assert_eq(type(n.cropEnabled), "boolean", "normalizedPrefs({}).cropEnabled is a real boolean")
-    assert_eq(n.imageToolPath, "", "normalizedPrefs({}).imageToolPath default empty string")
-    assert_eq(type(n.imageToolPath), "string", "normalizedPrefs({}).imageToolPath is a string")
-    assert_eq(n.maxCropEdge, 2048, "normalizedPrefs({}).maxCropEdge default 2048")
-    assert_eq(type(n.maxCropEdge), "number", "normalizedPrefs({}).maxCropEdge is a number")
 end
 do
-    assert_eq(S.normalizedPrefs({ cropEnabled = "true" }).cropEnabled, true,
-        "normalizedPrefs({cropEnabled='true'}).cropEnabled -> true")
-    assert_eq(S.normalizedPrefs({ cropEnabled = "false" }).cropEnabled, false,
-        "normalizedPrefs({cropEnabled='false'}).cropEnabled -> false (fail-closed string)")
-    assert_eq(S.normalizedPrefs({ imageToolPath = "/opt/homebrew/bin/magick" }).imageToolPath,
-        "/opt/homebrew/bin/magick", "normalizedPrefs surfaces a configured imageToolPath")
-    assert_eq(S.normalizedPrefs({ maxCropEdge = "4096" }).maxCropEdge, 4096,
-        "normalizedPrefs({maxCropEdge='4096'}).maxCropEdge -> number 4096")
 end
 
 -- normalizedPrefs NEVER raises (pcall battery)
 do
     local batteries = { nil, {}, { confidenceThreshold = "x" }, { previewSize = {} },
-                        { rateLimit = true }, { provider = 1, model = 2 },
+                        { provider = 1, model = 2 },
                         { confidenceThreshold = 1/0 } }
     for i = 1, #batteries do
         local ok = pcall(S.normalizedPrefs, batteries[i])
