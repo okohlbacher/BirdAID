@@ -145,3 +145,37 @@ do
     })
     assert_true(has(out, "<rect"), "missing label/title still renders a rect (no raise)")
 end
+
+-- =====================================================================
+-- S1: a bbox that OVERSHOOTS the frame is CLAMPED to [0,1] (pixels within [0,frameW]/[0,frameH]).
+-- {-0.5, 0.2, 1.5, 1.2} on a 100x100 frame must render the rect INSIDE the frame, not x="-50"
+-- width="200". After clamp: xmin=0, ymin=0.2, xmax=1, ymax=1 -> x=0,y=20,w=100,h=80.
+-- =====================================================================
+do
+    local out = svg.render({
+        frameW = 100, frameH = 100,
+        detections = {
+            { bbox = { -0.5, 0.2, 1.5, 1.2 }, label = "L", title = "T" },
+        },
+    })
+    assert_true(has(out, "<rect"), "overshooting bbox still renders a rect")
+    assert_true(not has(out, 'x="-50"'), "negative x is CLAMPED away (no x=\"-50\")")
+    assert_true(not has(out, 'width="200"'), "over-wide width is CLAMPED away (no width=\"200\")")
+    assert_true(has(out, 'x="0"'), "clamped x = 0 (xmin -0.5 -> 0)")
+    assert_true(has(out, 'y="20"'), "y = 0.2*100 = 20 (within frame)")
+    assert_true(has(out, 'width="100"'), "clamped width = full frame (xmax 1.5 -> 1)")
+    assert_true(has(out, 'height="80"'), "clamped height = 80 (ymax 1.2 -> 1, 1-0.2)")
+end
+
+-- =====================================================================
+-- S1: an INVERTED bbox (max < min) after clamping yields a non-negative width/height (edges ordered).
+-- =====================================================================
+do
+    local out = svg.render({
+        frameW = 100, frameH = 100,
+        detections = { { bbox = { 0.8, 0.8, 0.2, 0.2 }, label = "L", title = "T" } },
+    })
+    assert_true(has(out, 'x="20"'), "inverted bbox ordered: x = 0.2*100 = 20")
+    assert_true(has(out, 'width="60"'), "inverted bbox ordered: width = (0.8-0.2)*100 = 60")
+    assert_true(not has(out, 'width="-'), "no negative width from an inverted bbox")
+end

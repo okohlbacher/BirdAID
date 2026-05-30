@@ -51,7 +51,18 @@ local function coord(x)
     return tostring(r)
 end
 
+-- clamp v into [lo, hi].
+local function clamp(v, lo, hi)
+    if v < lo then return lo end
+    if v > hi then return hi end
+    return v
+end
+
 -- a bbox is a 4-element array of unit numbers, ordered. Returns x,y,w,h in pixels or nil.
+-- The normalized coords are CLAMPED to [0,1] (and so the emitted pixel rect lies inside the
+-- [0,frameW] x [0,frameH] frame) so a model bbox that overshoots (e.g. {-0.5,0.2,1.5,1.2})
+-- never renders outside the image (no x="-50" / width="200"). After clamping we also order the
+-- edges so a degenerate / inverted box yields a non-negative width/height.
 local function denorm(bbox, fw, fh)
     if type(bbox) ~= 'table' then return nil end
     local xmin, ymin, xmax, ymax = bbox[1], bbox[2], bbox[3], bbox[4]
@@ -59,6 +70,16 @@ local function denorm(bbox, fw, fh)
         or type(xmax) ~= 'number' or type(ymax) ~= 'number' then
         return nil
     end
+    -- reject non-finite coords (NaN / inf) rather than emitting garbage.
+    if xmin ~= xmin or ymin ~= ymin or xmax ~= xmax or ymax ~= ymax then return nil end
+    if xmin == INF or xmin == -INF or ymin == INF or ymin == -INF
+        or xmax == INF or xmax == -INF or ymax == INF or ymax == -INF then return nil end
+    -- clamp normalized coords to [0,1], then order edges (min<=max).
+    xmin = clamp(xmin, 0, 1); xmax = clamp(xmax, 0, 1)
+    ymin = clamp(ymin, 0, 1); ymax = clamp(ymax, 0, 1)
+    if xmax < xmin then xmin, xmax = xmax, xmin end
+    if ymax < ymin then ymin, ymax = ymax, ymin end
+    -- denormalize to pixels; the result is guaranteed within [0,frameW] x [0,frameH].
     local x = xmin * fw
     local y = ymin * fh
     local w = (xmax - xmin) * fw
