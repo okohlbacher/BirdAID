@@ -570,7 +570,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local jpegThumb = require 'src.cluster.jpeg_thumb'
         local similarity = require 'src.cluster.similarity'
         local resultsMod = require 'src.results'
-        local workerPool = require 'src.lr.worker_pool'
+        local stagedPool = require 'src.lr.staged_pool'   -- staged producer/consumer (preview decoupled)
         local stackReader = require 'src.lr.stack_reader'
         local vizReport = require 'src.lr.viz_report'
 
@@ -611,27 +611,49 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             })
         end
 
-        -- identifyFn(anchorKey) -> (response, err): resolve the handle, run the gated per-photo body.
-        local function identifyFn(anchorKey)
+        -- producerFetch(anchorKey) -> job | (nil, reason): MAIN-TASK serial preview fetch (the
+        -- reliable, one-render-at-a-time path). Stamps job.atIndex for the identify-side logs.
+        local function producerFetch(anchorKey)
             local photo = photoByKey[anchorKey]
             if photo == nil then return nil, 'no-photo-for-anchor' end
-            return identifyOnePhoto(photo, anchorKey, cropGate)
+            local job, reason = fetchJob(photo, anchorKey)
+            if job == nil then return nil, reason end
+            job.atIndex = anchorKey
+            return job
         end
 
-        -- poolRun(anchors) -> { statusByAnchorKey, responseByAnchorKey }: the worker pool over the
-        -- shared bucket/breaker; the worker_gate wraps each provider call (per-call token + after-
-        -- token cancel/breaker gate).
+        -- consumerIdentify(job) -> (status, response): the CONSUMER (parallel). The worker_gate
+        -- wraps the preview provider call with the per-call token + after-token cancel/breaker gate
+        -- (token now gates ONLY the provider call, not the preview fetch); crop re-queries use the
+        -- shared cropGate. Returns the gate's plain (status, response).
+        local function consumerIdentify(job)
+            local status, resp = workerGate.gate({
+                item       = job,
+                bucket     = bucket,
+                now        = cropWallClock,
+                sleep      = LrTasks.sleep,
+                isCanceled = function() return cancelled(progress) end,
+                breaker    = breaker,
+                identify   = function(it) return identifyAfterFetch(it, it.atIndex, cropGate) end,
+            })
+            return status, resp
+        end
+
+        -- poolRun(anchors) -> { statusByAnchorKey, responseByAnchorKey }: the STAGED driver fetches
+        -- previews SERIALLY on this (main) task and parallelizes only the gated provider call,
+        -- bounded to maxConcurrency in flight. This fixes the concurrent-preview-timeout bug.
         local function poolRun(anchors)
-            return workerPool.run({
+            return stagedPool.run({
                 items          = anchors,
                 maxConcurrency = prefs.maxConcurrency,
-                bucket         = bucket,
+                fetchJob       = producerFetch,
+                identifyJob    = consumerIdentify,
                 breaker        = breaker,
-                identifyFn     = identifyFn,
-                onCollect      = function() end,   -- responseByAnchorKey is the canonical store.
-                progress       = progress,
                 isCanceled     = function() return cancelled(progress) end,
-                pcall          = LrTasks.pcall,
+                spawn          = LrTasks.startAsyncTask,
+                sleep          = LrTasks.sleep,
+                yield          = LrTasks.yield,
+                progress       = progress,
                 runId          = runId,
             })
         end
