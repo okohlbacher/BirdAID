@@ -275,8 +275,17 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     -- NO catalog write (collect stays OUTSIDE the gate) and NO breaker-defer decision (the
     -- provider owns the breaker; the serial loop reads shouldStop after; the worker_pool gate
     -- re-reads shouldStop before each provider call). `atIndex` is for logging only.
+    --
+    -- `cropGate` (FEATURE BRANCH ONLY) routes each crop re-query provider call through the SAME
+    -- pure worker_gate.gate(...) sequence as the preview call (acquire token -> after-token
+    -- isCanceled? -> after-token breaker.shouldStop? -> else provider.identify). It is
+    -- cropGate(cropImage, ctx) -> (status, response, err) with status one of
+    -- 'identified'|'cancelled'|'deferred'|'fatal'. A nil cropGate (the DEFAULT-SAFE BYPASS path,
+    -- featuresOff) keeps today's EXACT serial crop behavior: the crop re-query is the direct,
+    -- ungated provider.identify call. A crop-call 'cancelled'/'deferred' MUST propagate (we abort
+    -- the per-photo identify with that reason) -- it is NEVER silently downgraded to an ungated call.
     -- ===========================================================================
-    local function identifyOnePhoto(photo, atIndex)
+    local function identifyOnePhoto(photo, atIndex, cropGate)
         local file = photoName(photo)
 
         -- ---- Preview fetch -------------------------------------------------
@@ -365,18 +374,38 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                                         file = file, reason = tostring(crErr),
                                     })
                                 else
-                                    -- Re-query the SAME provider on the crop (kind='file'). NOTE: in
-                                    -- the feature branch this re-query is itself a provider call; the
-                                    -- worker_gate's per-call token+shouldStop gate wraps identifyFn,
-                                    -- which is THIS function — the first/outermost provider call is
-                                    -- gated by the driver; the crop re-query shares the same breaker
-                                    -- (the provider records it) so a latch still defers subsequent runs.
+                                    -- Re-query the SAME provider on the crop (kind='file').
+                                    -- FEATURE BRANCH: route the crop provider call through the SAME
+                                    -- worker_gate.gate(...) sequence as the preview call (cropGate),
+                                    -- so it acquires its own token and re-checks isCanceled/breaker.
+                                    -- shouldStop IMMEDIATELY before the call. A 'cancelled'/'deferred'
+                                    -- gate outcome PROPAGATES (aborts this photo) — it is NEVER
+                                    -- silently downgraded to an ungated provider call. BYPASS PATH
+                                    -- (cropGate==nil): EXACT today's serial ungated direct call.
                                     local cropImage = {
                                         kind = 'file', path = cropPath,
                                         width = rect.w, height = rect.h,
                                     }
                                     http.attachImage(cropImage)
-                                    local cropResp, cqErr = provider.identify(cropImage, ctx)
+                                    local cropResp, cqErr
+                                    if cropGate ~= nil then
+                                        local status, gResp, gErr = cropGate(cropImage, ctx)
+                                        if status == 'cancelled' or status == 'deferred' then
+                                            -- Propagate: the gate refused this provider call. Surface
+                                            -- it as the per-photo error so the driver classifies the
+                                            -- WHOLE item with this terminal reason (never an ungated
+                                            -- fall-back). 'cancelled' -> cancel; 'deferred' -> breaker.
+                                            log.info("crop re-query gate refused provider call (propagating)", {
+                                                runId = runId, atIndex = atIndex, detection = di,
+                                                file = file, reason = status,
+                                            })
+                                            return nil, status
+                                        end
+                                        -- 'identified' carries the response; 'fatal' carries gErr.
+                                        cropResp, cqErr = gResp, gErr
+                                    else
+                                        cropResp, cqErr = provider.identify(cropImage, ctx)
+                                    end
                                     local refined
                                     if cropResp ~= nil then
                                         local cvok, cvmsg = contract.validateResponse(cropResp)
@@ -503,6 +532,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- here so the bypass never loads them.
         -- =======================================================================
         local tokenBucket = require 'src.net.token_bucket'
+        local workerGate = require 'src.net.worker_gate'   -- PURE per-provider-call gate (crop re-query).
         local clusterGroup = require 'src.cluster.group'
         local jpegThumb = require 'src.cluster.jpeg_thumb'
         local similarity = require 'src.cluster.similarity'
@@ -588,12 +618,39 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local rate = (type(rateLimit) == 'number' and rateLimit > 0) and (1 / rateLimit) or 0
         local bucket = tokenBucket.new({ rate = rate, capacity = 1, now0 = 0 })
 
+        -- Wall clock for the SHARED bucket: a monotonically-advancing real-time seconds value (NOT
+        -- CPU time), matching worker_pool's wallClockSeconds so the crop re-query gate and the
+        -- preview gate consume from the SAME bucket against the SAME advancing clock.
+        local function cropWallClock()
+            local ok, t = pcall(function() return LrDate.currentTime() end)
+            if ok and type(t) == 'number' and t == t then return t end
+            return os.time()
+        end
+
+        -- CROP RE-QUERY GATE (FEATURE BRANCH ONLY): each crop provider call goes through the SAME
+        -- pure worker_gate.gate sequence as the preview call — acquire ONE token from the shared
+        -- bucket, re-check isCanceled (cancel WINS), re-check breaker.shouldStop (READ-ONLY; the
+        -- provider owns record), else call provider.identify(cropImage, ctx). Returns the gate's
+        -- plain (status, response, err); identifyOnePhoto propagates 'cancelled'/'deferred'.
+        local function cropGate(cropImage, ctx)
+            return workerGate.gate({
+                item       = cropImage,
+                bucket     = bucket,
+                now        = cropWallClock,
+                sleep      = LrTasks.sleep,
+                isCanceled = function() return cancelled(progress) end,
+                breaker    = breaker,
+                identify   = function() return provider.identify(cropImage, ctx) end,
+            })
+        end
+
         -- identifyFn for an anchor key -> (response, err). Look up the Lr handle from photoByKey;
-        -- the worker_gate wraps THIS call with the per-call token + after-token shouldStop gate.
+        -- the worker_gate wraps THIS (outermost) call with the per-call token + after-token
+        -- shouldStop gate; the threaded cropGate gates EACH crop re-query the same way.
         local function identifyFn(anchorKey)
             local photo = photoByKey[anchorKey]
             if photo == nil then return nil, 'no-photo-for-anchor' end
-            return identifyOnePhoto(photo, anchorKey)
+            return identifyOnePhoto(photo, anchorKey, cropGate)
         end
 
         local poolOut = workerPool.run({
@@ -656,7 +713,11 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                     local photo = entry.photo
                     local file = photoName(photo)
                     -- Re-fetch the small preview bytes + dims for the report (OUTSIDE the gate).
-                    pcall(function()
+                    -- YIELD-SAFE: previewFetch.fetch yields (LrTasks.sleep) and vizReport.writeAndOpen
+                    -- may LrTasks.execute (open) — both yield across a C frame, so this MUST be the
+                    -- yield-safe LrTasks.pcall, NEVER a standard C pcall (Lua 5.1 forbids yielding
+                    -- across a standard pcall boundary).
+                    LrTasks.pcall(function()
                         local transport = previewFetch.fetch(photo, maxEdge, {
                             isCanceled = function() return cancelled(progress) end,
                             file = file, runId = runId,
