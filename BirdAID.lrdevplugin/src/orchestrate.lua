@@ -142,4 +142,116 @@ function M.buildAdapterEntries(opts)
     }
 end
 
+-- ---------------------------------------------------------------------------
+-- runFeatures(deps) — the PURE feature-branch SEQUENCE (BL-06/07/04 dispatch).
+-- Composes buildFrames -> optional cluster pre-pass (via injected fetchGrid + similarGrids +
+-- group) -> poolRun(anchors) -> resultsBuild -> buildAdapterEntries. EVERY Lr-touching step is
+-- INJECTED so the e2e spec drives the REAL sequence (not a model). deps = {
+--   prefs, photos, photoKeyOf, timeEpochOf, stackIdOf,   -- framing
+--   fetchGrid(photo,i)->grid|nil, similarGrids(a,b)->bool, group(frames,opts)->{anchors,followerToAnchor},
+--   poolRun(anchors)->{statusByAnchorKey,responseByAnchorKey},
+--   resultsBuild(args)->{ordered=...}, readExistingNames(handle)->{names},
+-- } -> { results, identified, deferred, cancelled, errored, anchors, followers, photoByKey, poolOut }.
+-- ---------------------------------------------------------------------------
+function M.runFeatures(deps)
+    deps = type(deps) == 'table' and deps or {}
+    local prefs = type(deps.prefs) == 'table' and deps.prefs or {}
+    local photos = type(deps.photos) == 'table' and deps.photos or {}
+    local photoKeyOf = type(deps.photoKeyOf) == 'function' and deps.photoKeyOf or tostring
+    local fetchGrid = type(deps.fetchGrid) == 'function' and deps.fetchGrid or function() return nil end
+    local similarGrids = type(deps.similarGrids) == 'function' and deps.similarGrids or function() return false end
+    local group = type(deps.group) == 'function' and deps.group or nil
+    local poolRun = type(deps.poolRun) == 'function' and deps.poolRun
+        or function() return { statusByAnchorKey = {}, responseByAnchorKey = {} } end
+    local resultsBuild = type(deps.resultsBuild) == 'function' and deps.resultsBuild
+        or function() return { ordered = {} } end
+    local readExistingNames = type(deps.readExistingNames) == 'function'
+        and deps.readExistingNames or function() return {} end
+
+    local framing = M.buildFrames({
+        photos = photos, photoKeyOf = photoKeyOf,
+        timeEpochOf = deps.timeEpochOf, stackIdOf = deps.stackIdOf,
+    })
+    local photoByKey = framing.photoByKey
+    local selection = framing.selection
+
+    local anchors, followerToAnchor
+    if prefs.clusterBursts == true and group then
+        -- Per-photo grid (INJECTED fetchGrid: >=128px thumb -> DC-luma; nil => not-similar => no merge).
+        local gridByKey = {}
+        for i = 1, #photos do
+            local photo = photos[i]
+            gridByKey[photoKeyOf(photo)] = fetchGrid(photo, i)
+        end
+        local sim = function(prevKey, curKey)
+            return similarGrids(gridByKey[prevKey], gridByKey[curKey])
+        end
+        local grp = group(framing.frames, {
+            maxGapSeconds = prefs.clusterMaxGapSeconds,
+            useStacks     = prefs.clusterUseStacks,
+            sim           = sim,
+        })
+        anchors = (type(grp) == 'table' and type(grp.anchors) == 'table') and grp.anchors or {}
+        followerToAnchor = (type(grp) == 'table' and type(grp.followerToAnchor) == 'table')
+            and grp.followerToAnchor or {}
+    else
+        -- Clustering off (another feature on): every photo is its own anchor.
+        anchors = {}
+        for i = 1, #selection do anchors[#anchors + 1] = selection[i] end
+        followerToAnchor = {}
+    end
+
+    -- Consume the worker_pool.run RETURN (blocker A): status/response keyed by anchor.
+    local poolOut = poolRun(anchors)
+    if type(poolOut) ~= 'table' then poolOut = {} end
+    local resModel = resultsBuild({
+        selection        = selection,
+        anchors          = anchors,
+        followerToAnchor = followerToAnchor,
+        anchorStatus     = type(poolOut.statusByAnchorKey) == 'table' and poolOut.statusByAnchorKey or {},
+        anchorResponse   = type(poolOut.responseByAnchorKey) == 'table' and poolOut.responseByAnchorKey or {},
+    })
+    if type(resModel) ~= 'table' then resModel = { ordered = {} } end
+
+    local adapter = M.buildAdapterEntries({
+        ordered           = type(resModel.ordered) == 'table' and resModel.ordered or {},
+        photoByKey        = photoByKey,
+        readExistingNames = readExistingNames,
+    })
+
+    local followers = 0
+    for _ in pairs(followerToAnchor) do followers = followers + 1 end
+
+    return {
+        results    = adapter.entries,
+        identified = adapter.identified,
+        deferred   = adapter.deferred,
+        cancelled  = adapter.cancelled,
+        errored    = adapter.errored,
+        anchors    = #anchors,
+        followers  = followers,
+        photoByKey = photoByKey,
+        poolOut    = poolOut,
+    }
+end
+
+-- ---------------------------------------------------------------------------
+-- dispatch(deps) — the HARD default-safe bypass DECISION over two thunks (the REAL branch the
+-- entry takes). featuresOff (computed from prefs if not given) ⇒ run the SERIAL thunk and NEVER
+-- the feature thunk (so the entry's lazy feature requires never happen at defaults); else run the
+-- feature thunk. Returns whatever the chosen thunk returns. deps = {
+--   featuresOff = bool | nil (nil ⇒ M.featuresOff(prefs)), prefs, runSerial = fn, runFeatures = fn }.
+-- ---------------------------------------------------------------------------
+function M.dispatch(deps)
+    deps = type(deps) == 'table' and deps or {}
+    local off = deps.featuresOff
+    if off == nil then off = M.featuresOff(deps.prefs) end
+    if off then
+        if type(deps.runSerial) == 'function' then return deps.runSerial() end
+        return nil
+    end
+    if type(deps.runFeatures) == 'function' then return deps.runFeatures() end
+    return nil
+end
+
 return M

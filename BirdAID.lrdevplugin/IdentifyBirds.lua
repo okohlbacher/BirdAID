@@ -446,7 +446,12 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local deferred     = 0    -- photos skipped after the breaker opened / deferred clusters.
     local cancelledCnt = 0    -- photos cancelled (feature branch reports this; serial folds into break).
 
-    if featuresOff then
+    -- The REAL dispatch decision lives in orchestrate.dispatch (spec-driven): at defaults it runs
+    -- runSerial and NEVER runFeatures, so the feature modules' LAZY requires (inside runFeatures)
+    -- never load. Any feature ON runs runFeatures (the spec-tested orchestrate.runFeatures sequence).
+    orchestrate.dispatch({
+        featuresOff = featuresOff,
+        runSerial = function()
         -- =======================================================================
         -- DEFAULT-SAFE HARD BYPASS — the EXISTING serial loop, VERBATIM. NO feature module is
         -- required or called here (orchestrate.featuresOff guaranteed all features are off).
@@ -526,7 +531,8 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
 
             LrTasks.yield()   -- cooperative: keep the UI responsive.
         end
-    else
+        end,   -- runSerial
+        runFeatures = function()
         -- =======================================================================
         -- FEATURE BRANCH (some Phase-9 feature is ON). LAZY-require the feature modules ONLY
         -- here so the bypass never loads them.
@@ -546,92 +552,26 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- runs' dirs cannot leak across later report-disabled runs.
         pcall(function() vizReport.sweepOrphans(runId) end)
 
-        -- (1) OPTIONAL cluster pre-pass + photoByKey (always built for the adapter).
-        local framing = orchestrate.buildFrames({
-            photos      = photos,
-            photoKeyOf  = tostring,
-            timeEpochOf = function(p) return stackReader.captureTimeEpoch(p) end,
-            stackIdOf   = function(p)
-                if prefs.clusterBursts ~= true then return nil end
-                return stackReader.stackId(p)
-            end,
-        })
-        local photoByKey = framing.photoByKey
-        local selection = framing.selection
+        -- Build the per-photo handle map (tostring keys, MATCHING orchestrate.runFeatures'
+        -- photoKeyOf=tostring) so identifyFn can resolve an anchor key -> Lr handle.
+        local photoByKey = {}
+        for i = 1, #photos do photoByKey[tostring(photos[i])] = photos[i] end
 
-        local anchors, followerToAnchor
-        if prefs.clusterBursts == true then
-            -- Per-photo >=128px thumbnail -> PURE DC-luma 8x8 grid, cached by key. A nil grid =>
-            -- not similar (no merge), the SAFE direction. Guarded per-photo; never aborts the run.
-            local gridByKey = {}
-            for i = 1, #photos do
-                local photo = photos[i]
-                local key = tostring(photo)
-                local file = photoName(photo)
-                local okFetch, bytes = LrTasks.pcall(function()
-                    return previewFetch.fetchThumbBytes(photo, 128, {
-                        isCanceled = function() return cancelled(progress) end,
-                        file = file, runId = runId,
-                    })
-                end)
-                if okFetch and type(bytes) == 'string' and bytes ~= '' then
-                    local okGrid, grid = pcall(function() return jpegThumb.dcLumaGrid(bytes) end)
-                    if okGrid then gridByKey[key] = grid end
-                end
-                -- Log the stack-key probe (token-free) so the live Task-12 pass reveals real keys.
-                local okProbe, probe = pcall(function() return stackReader.probe(photo) end)
-                if okProbe and type(probe) == 'table' and type(probe.keysWithValues) == 'table'
-                    and #probe.keysWithValues > 0 then
-                    log.info("stack-key probe (clustering)", {
-                        runId = runId, atIndex = i, file = file,
-                        stackKeys = table.concat(probe.keysWithValues, ","),
-                    })
-                end
-            end
-
-            local sim = function(prevKey, curKey)
-                return similarity.similar(gridByKey[prevKey], gridByKey[curKey],
-                    prefs.clusterSimilarityThreshold)
-            end
-            local grp = clusterGroup.group(framing.frames, {
-                maxGapSeconds = prefs.clusterMaxGapSeconds,
-                useStacks     = prefs.clusterUseStacks,
-                sim           = sim,
-            })
-            anchors = grp.anchors
-            followerToAnchor = grp.followerToAnchor
-        else
-            -- Clustering off (but another feature on): every photo is its own anchor.
-            anchors = {}
-            for i = 1, #selection do anchors[#anchors + 1] = selection[i] end
-            followerToAnchor = {}
-        end
-
-        log.info("cluster pre-pass done", {
-            runId = runId, total = n, anchors = #anchors,
-            followers = (function() local c = 0; for _ in pairs(followerToAnchor) do c = c + 1 end; return c end)(),
-            clustering = prefs.clusterBursts,
-        })
-
-        -- (2) DISPATCH the ANCHORS via the pool. The token bucket gates EVERY provider call
-        -- (capacity=1, no bursting). rate = 1/rateLimit tokens/sec (rateLimit<=0 => unlimited).
+        -- SHARED token bucket (capacity=1; rate = 1/rateLimit tokens/sec; <=0 => unlimited) gates
+        -- EVERY provider call across all workers AND crop re-queries.
         local rate = (type(rateLimit) == 'number' and rateLimit > 0) and (1 / rateLimit) or 0
         local bucket = tokenBucket.new({ rate = rate, capacity = 1, now0 = 0 })
 
-        -- Wall clock for the SHARED bucket: a monotonically-advancing real-time seconds value (NOT
-        -- CPU time), matching worker_pool's wallClockSeconds so the crop re-query gate and the
-        -- preview gate consume from the SAME bucket against the SAME advancing clock.
+        -- Wall clock for the SHARED bucket (real-time seconds, NOT CPU time), matching the pool's.
         local function cropWallClock()
             local ok, t = pcall(function() return LrDate.currentTime() end)
             if ok and type(t) == 'number' and t == t then return t end
             return os.time()
         end
 
-        -- CROP RE-QUERY GATE (FEATURE BRANCH ONLY): each crop provider call goes through the SAME
-        -- pure worker_gate.gate sequence as the preview call — acquire ONE token from the shared
-        -- bucket, re-check isCanceled (cancel WINS), re-check breaker.shouldStop (READ-ONLY; the
-        -- provider owns record), else call provider.identify(cropImage, ctx). Returns the gate's
-        -- plain (status, response, err); identifyOnePhoto propagates 'cancelled'/'deferred'.
+        -- Crop re-query gate: SAME worker_gate sequence as the preview call (shared bucket + breaker;
+        -- cancel WINS; breaker READ-ONLY; provider owns record). identifyOnePhoto propagates a
+        -- 'cancelled'/'deferred' gate outcome.
         local function cropGate(cropImage, ctx)
             return workerGate.gate({
                 item       = cropImage,
@@ -644,43 +584,76 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             })
         end
 
-        -- identifyFn for an anchor key -> (response, err). Look up the Lr handle from photoByKey;
-        -- the worker_gate wraps THIS (outermost) call with the per-call token + after-token
-        -- shouldStop gate; the threaded cropGate gates EACH crop re-query the same way.
+        -- identifyFn(anchorKey) -> (response, err): resolve the handle, run the gated per-photo body.
         local function identifyFn(anchorKey)
             local photo = photoByKey[anchorKey]
             if photo == nil then return nil, 'no-photo-for-anchor' end
             return identifyOnePhoto(photo, anchorKey, cropGate)
         end
 
-        local poolOut = workerPool.run({
-            items          = anchors,
-            maxConcurrency = prefs.maxConcurrency,
-            bucket         = bucket,
-            breaker        = breaker,
-            identifyFn     = identifyFn,
-            onCollect      = function() end,   -- responseByAnchorKey is the canonical store.
-            progress       = progress,
-            isCanceled     = function() return cancelled(progress) end,
-            pcall          = LrTasks.pcall,
-            runId          = runId,
-        })
+        -- poolRun(anchors) -> { statusByAnchorKey, responseByAnchorKey }: the worker pool over the
+        -- shared bucket/breaker; the worker_gate wraps each provider call (per-call token + after-
+        -- token cancel/breaker gate).
+        local function poolRun(anchors)
+            return workerPool.run({
+                items          = anchors,
+                maxConcurrency = prefs.maxConcurrency,
+                bucket         = bucket,
+                breaker        = breaker,
+                identifyFn     = identifyFn,
+                onCollect      = function() end,   -- responseByAnchorKey is the canonical store.
+                progress       = progress,
+                isCanceled     = function() return cancelled(progress) end,
+                pcall          = LrTasks.pcall,
+                runId          = runId,
+            })
+        end
 
-        -- (3) BUILD PER-PHOTO RESULTS — consume worker_pool.run's RETURN (blocker A).
-        local resModel = resultsMod.build({
-            selection        = selection,
-            anchors          = anchors,
-            followerToAnchor = followerToAnchor,
-            anchorStatus     = poolOut.statusByAnchorKey,
-            anchorResponse   = poolOut.responseByAnchorKey,
-        })
+        -- fetchGrid(photo,i): >=128px thumb bytes -> PURE DC-luma grid (nil => not similar => no
+        -- merge, the SAFE direction). Guarded; logs the token-free stack-key probe for Task 12.
+        local function fetchGrid(photo, i)
+            local file = photoName(photo)
+            local grid = nil
+            local okFetch, bytes = LrTasks.pcall(function()
+                return previewFetch.fetchThumbBytes(photo, 128, {
+                    isCanceled = function() return cancelled(progress) end,
+                    file = file, runId = runId,
+                })
+            end)
+            if okFetch and type(bytes) == 'string' and bytes ~= '' then
+                local okGrid, g = pcall(function() return jpegThumb.dcLumaGrid(bytes) end)
+                if okGrid then grid = g end
+            end
+            local okProbe, probe = pcall(function() return stackReader.probe(photo) end)
+            if okProbe and type(probe) == 'table' and type(probe.keysWithValues) == 'table'
+                and #probe.keysWithValues > 0 then
+                log.info("stack-key probe (clustering)", {
+                    runId = runId, atIndex = i, file = file,
+                    stackKeys = table.concat(probe.keysWithValues, ","),
+                })
+            end
+            return grid
+        end
 
-        -- (3b) RESULTS->WRITEPLAN ADAPTER (blocker B) — PER-PHOTO existingNames, NEVER inherited.
-        -- The read runs OUTSIDE the write gate (a catalog read), wrapped so a throwing read
-        -- degrades that photo to empty-existing rather than aborting.
-        local adapter = orchestrate.buildAdapterEntries({
-            ordered    = resModel.ordered,
-            photoByKey = photoByKey,
+        -- DRIVE THE REAL PURE SEQUENCE: buildFrames -> optional cluster -> poolRun(anchors) ->
+        -- results.build -> per-photo adapter. This is the SAME orchestrate.runFeatures the e2e spec
+        -- drives, so the entry's actual dispatch is what the spec covers (blockers A/B + adapter).
+        local fr = orchestrate.runFeatures({
+            prefs       = prefs,
+            photos      = photos,
+            photoKeyOf  = tostring,
+            timeEpochOf = function(p) return stackReader.captureTimeEpoch(p) end,
+            stackIdOf   = function(p)
+                if prefs.clusterBursts ~= true then return nil end
+                return stackReader.stackId(p)
+            end,
+            fetchGrid    = fetchGrid,
+            similarGrids = function(a, b)
+                return similarity.similar(a, b, prefs.clusterSimilarityThreshold)
+            end,
+            group        = clusterGroup.group,
+            poolRun      = poolRun,
+            resultsBuild = resultsMod.build,
             readExistingNames = function(handle)
                 local ok, names = LrTasks.pcall(function()
                     return catalogWriter.readExistingNames(handle)
@@ -688,14 +661,15 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                 return (ok and type(names) == 'table') and names or {}
             end,
         })
-        results  = adapter.entries
-        deferred = adapter.deferred
-        cancelledCnt = adapter.cancelled
-        if cancelledCnt > 0 then wasCancelled = true end
+        results      = fr.results
+        deferred     = fr.deferred
+        cancelledCnt = fr.cancelled
+        if cancelledCnt and cancelledCnt > 0 then wasCancelled = true end
 
         log.info("collect done (feature branch)", {
-            runId = runId, total = n, identified = adapter.identified,
-            deferred = adapter.deferred, cancelled = adapter.cancelled, errored = adapter.errored,
+            runId = runId, total = n, identified = fr.identified,
+            deferred = fr.deferred, cancelled = fr.cancelled, errored = fr.errored,
+            anchors = fr.anchors, followers = fr.followers,
         })
 
         -- (5) OPTIONAL DETECTION REPORT (showDetectionReport, NOT dry-run). Post-collect, OUTSIDE
@@ -703,9 +677,9 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- Guarded per photo; never blocks the run; cancel-aware.
         if prefs.showDetectionReport == true and prefs.dryRun ~= true then
             local repIdx = 0
-            for ei = 1, #adapter.entries do
+            for ei = 1, #fr.results do
                 if cancelled(progress) then break end
-                local entry = adapter.entries[ei]
+                local entry = fr.results[ei]
                 local resp = entry.response
                 if type(resp) == 'table' and type(resp.detections) == 'table'
                     and #resp.detections > 0 then
@@ -734,7 +708,8 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                 end
             end
         end
-    end
+        end,   -- runFeatures
+    })
 
     -- ---- PLAN (pure) ----------------------------------------------------------
     local report = writeplan.planReport(results, prefs)

@@ -84,11 +84,12 @@ do
 end
 
 -- =====================================================================
--- DEFAULT-SAFE HARD BYPASS — spy/branch check.
--- A minimal driver that mirrors the entry's branch: featuresOff -> serial path that NEVER touches
--- the injected feature spies; else -> the feature path that does. We assert that at defaults every
--- spy stays at ZERO calls, and that the serial branch's writeplan == the feature path is irrelevant
--- (the point is zero feature-module calls + identical plan/summary to a serial baseline).
+-- DEFAULT-SAFE HARD BYPASS — drives the REAL orchestrate.dispatch (NOT a model).
+-- orchestrate.dispatch is the actual decision the entry takes: featuresOff -> runSerial thunk and
+-- NEVER the runFeatures thunk. The entry's lazy feature requires + every feature call live INSIDE
+-- the runFeatures thunk, so a zero-call runFeatures here proves zero feature-module use at defaults.
+-- We assert dispatch runs serial (not features), every feature spy stays ZERO, and the bypass plan
+-- equals a standalone serial baseline.
 -- =====================================================================
 do
     -- Spy counters for each feature module.
@@ -119,22 +120,23 @@ do
         return writeplan.planReport(res, prefs())
     end
 
-    -- The DRIVER under test: branch on featuresOff. If bypass, run serialBaseline and touch NO spy.
+    -- The DRIVER under test is the REAL orchestrate.dispatch. At defaults it MUST call runSerial and
+    -- NEVER runFeatures; the runFeatures thunk touches every feature spy, so a mis-branch lights them.
     local function driveBypassPath()
-        local p = prefs()
-        if orchestrate.featuresOff(p) then
-            return serialBaseline()
-        end
-        -- feature path (NOT taken at defaults): exercise every spy so a regression that mis-branches
-        -- would light them up.
-        spyReportSweep('run')
-        local fr = orchestrate.buildFrames({ photos = photos, photoKeyOf = tostring })
-        local grp = spyClusterGroup(fr.frames, {})
-        spyJpegThumb('x'); spySimilar('a', 'b')
-        local pool = spyWorkerPoolRun({ items = grp.anchors })
-        spyResultsBuild({ selection = fr.selection })
-        spyReportWrite({})
-        return { plan = { entries = {} }, summary = { perRun = {} }, dryRun = false }
+        return orchestrate.dispatch({
+            prefs       = prefs(),
+            runSerial   = serialBaseline,
+            runFeatures = function()
+                spyReportSweep('run')
+                local fr = orchestrate.buildFrames({ photos = photos, photoKeyOf = tostring })
+                local grp = spyClusterGroup(fr.frames, {})
+                spyJpegThumb('x'); spySimilar('a', 'b')
+                spyWorkerPoolRun({ items = grp.anchors })
+                spyResultsBuild({ selection = fr.selection })
+                spyReportWrite({})
+                return { plan = { entries = {} }, summary = { perRun = {} }, dryRun = false }
+            end,
+        })
     end
 
     local report = driveBypassPath()
@@ -178,32 +180,39 @@ do
     assert_eq(grp.followerToAnchor['p2'], 'p1', "compose: p2 follows p1")
     assert_eq(grp.followerToAnchor['p3'], 'p1', "compose: p3 follows p1")
 
-    -- The orchestrator dispatches EXACTLY the anchors.
+    -- Drive the REAL orchestrate.runFeatures sequence end-to-end: it must pass EXACTLY the anchors to
+    -- poolRun, consume poolRun's RETURN into the REAL results.build, and read existingNames PER-PHOTO
+    -- (each photo's OWN handle). poolRun + readExistingNames are spies; group + results.build are real.
     local dispatchedItems = nil
-    local fakeWorkerPoolRun = function(opts)
-        dispatchedItems = opts.items
-        return {
-            statusByAnchorKey   = { p1 = 'identified' },
-            responseByAnchorKey = { p1 = cardinalResponse() },
-        }
-    end
-    local pool = fakeWorkerPoolRun({ items = grp.anchors })
-    assert_eq(#dispatchedItems, 1, "compose: exactly the anchors dispatched (followers excluded)")
-    assert_eq(dispatchedItems[1], 'p1', "compose: the dispatched item is the anchor")
-
-    -- Consume the RETURN into results.build (blocker A): feed statusByAnchorKey/responseByAnchorKey.
-    local resModel = results.build({
-        selection        = fr.selection,
-        anchors          = grp.anchors,
-        followerToAnchor = grp.followerToAnchor,
-        anchorStatus     = pool.statusByAnchorKey,
-        anchorResponse   = pool.responseByAnchorKey,
+    local readSeen = {}
+    local frx = orchestrate.runFeatures({
+        prefs       = prefs({ clusterBursts = true, clusterMaxGapSeconds = 5,
+                              clusterUseStacks = false, clusterSimilarityThreshold = 10 }),
+        photos      = photos,
+        photoKeyOf  = tostring,
+        timeEpochOf = function(p) return ({ p1 = 100, p2 = 100.1, p3 = 100.2 })[p] end,
+        stackIdOf   = function() return nil end,
+        fetchGrid   = function(p) return p end,            -- non-nil grid per photo
+        similarGrids = function() return true end,         -- all similar -> one burst (p1 anchor)
+        group       = group.group,                          -- the REAL pure grouper
+        poolRun     = function(anchors)
+            dispatchedItems = anchors
+            return { statusByAnchorKey   = { p1 = 'identified' },
+                     responseByAnchorKey = { p1 = cardinalResponse() } }
+        end,
+        resultsBuild = results.build,                       -- the REAL results model
+        readExistingNames = function(handle)
+            readSeen[handle] = (readSeen[handle] or 0) + 1; return {}
+        end,
     })
-    assert_eq(#resModel.ordered, 3, "compose: one result per selected photo")
-    assert_eq(resModel.byPhoto['p1'].status, 'identified', "compose: anchor identified")
-    assert_eq(resModel.byPhoto['p2'].status, 'identified', "compose: follower p2 inherits identified")
-    assert_eq(resModel.byPhoto['p3'].status, 'identified', "compose: follower p3 inherits identified")
-    assert_eq(resModel.byPhoto['p2'].inheritedFrom, 'p1', "compose: follower p2 inheritedFrom anchor")
+    assert_eq(#dispatchedItems, 1, "runFeatures: EXACTLY the anchors dispatched to poolRun (followers excluded)")
+    assert_eq(dispatchedItems[1], 'p1', "runFeatures: the dispatched anchor is p1")
+    assert_eq(#frx.results, 3, "runFeatures: one writeplan entry per photo (anchor + 2 inheriting followers)")
+    assert_eq(frx.anchors, 1, "runFeatures: one anchor")
+    assert_eq(frx.followers, 2, "runFeatures: two followers")
+    assert_eq(readSeen['p1'], 1, "runFeatures: existingNames read for p1's OWN handle")
+    assert_eq(readSeen['p2'], 1, "runFeatures: existingNames read for follower p2's OWN handle (per-photo, not inherited)")
+    assert_eq(readSeen['p3'], 1, "runFeatures: existingNames read for follower p3's OWN handle (per-photo, not inherited)")
 end
 
 -- =====================================================================
