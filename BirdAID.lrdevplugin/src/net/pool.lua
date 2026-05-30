@@ -54,7 +54,10 @@ end
 function M.new(opts)
     opts = type(opts) == 'table' and opts or {}
     local items = type(opts.items) == 'table' and opts.items or {}
-    local maxConcurrency = tonumber(opts.maxConcurrency) or 1
+    -- defensively FLOOR + clamp maxConcurrency (settings already floors it, but the controller is
+    -- the last line of defence): a fractional / sub-1 value collapses to 1 so inFlight gating is sane.
+    local maxConcurrency = math.floor(tonumber(opts.maxConcurrency) or 1)
+    if maxConcurrency ~= maxConcurrency then maxConcurrency = 1 end  -- NaN guard.
     if maxConcurrency < 1 then maxConcurrency = 1 end
     local breaker = opts.breaker
 
@@ -63,6 +66,7 @@ function M.new(opts)
     local inFlight = 0
     local cancelled = false
     local terminal = {}         -- [key] = terminal status
+    local dispatched = {}       -- [key] = true while in-flight (dispatched, not yet resolved)
     local dispatchedCount = 0
     local total = #items
 
@@ -112,15 +116,21 @@ function M.new(opts)
         cursor = cursor + 1
         inFlight = inFlight + 1
         dispatchedCount = dispatchedCount + 1
+        dispatched[key] = true
         return { action = 'dispatch', key = key, slot = inFlight }
     end
 
     function self.onResult(key, outcome)
         -- free the slot + record the terminal status. NEVER touch the breaker.
-        if terminal[key] == nil then
-            terminal[key] = normalizeOutcome(outcome)
-            if inFlight > 0 then inFlight = inFlight - 1 end
-        end
+        -- GHOST / DUPLICATE GUARD: only a key currently in `dispatched` (in-flight, not yet
+        -- resolved) may free a slot. A completion for an unknown key (never dispatched) or for a
+        -- key already resolved (duplicate onResult) is IGNORED — no inFlight decrement, no terminal
+        -- write, no double-count — so a stray completion can NEVER over-dispatch by freeing a real
+        -- in-flight slot.
+        if not dispatched[key] then return end
+        dispatched[key] = nil
+        terminal[key] = normalizeOutcome(outcome)
+        if inFlight > 0 then inFlight = inFlight - 1 end
     end
 
     function self.cancel()

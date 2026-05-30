@@ -217,3 +217,65 @@ do
     assert_eq(p.nextDispatch(0).action, 'done', "no items -> done immediately")
     assert_eq(count(p.terminalStatus()), 0, "no terminal entries")
 end
+
+-- =====================================================================
+-- S3: onResult for a GHOST key (never dispatched) is IGNORED -- no inFlight decrement, no
+-- terminal write, no double-count. It must NOT free a real in-flight slot (which would over-dispatch).
+-- =====================================================================
+do
+    local br = spyBreaker()
+    local p = pool.new({ items = { 'a', 'b' }, maxConcurrency = 1, breaker = br })
+    local da = p.nextDispatch(0)            -- dispatch 'a' (the only slot is now occupied).
+    assert_eq(da.key, 'a', "first dispatch is a")
+    assert_eq(p.state().inFlight, 1, "one in flight")
+    -- a ghost completion for a key that was NEVER dispatched.
+    p.onResult('ghost', 'identified')
+    assert_eq(p.state().inFlight, 1, "ghost onResult does NOT free the real in-flight slot")
+    -- the slot is still occupied, so no new dispatch is allowed.
+    assert_eq(p.nextDispatch(0).action, 'idle', "ghost did not over-dispatch -> still idle")
+    assert_eq(p.terminalStatus().ghost, nil, "ghost key never recorded a terminal status")
+    -- resolving the real in-flight item frees the slot normally.
+    p.onResult('a', 'identified')
+    assert_eq(p.state().inFlight, 0, "real onResult frees the slot")
+    local db = p.nextDispatch(0)
+    assert_eq(db.key, 'b', "now b dispatches (slot freed by the REAL completion)")
+end
+
+-- =====================================================================
+-- S3: a DUPLICATE onResult for the same (already-completed) key is a NO-OP -- it does not
+-- double-decrement inFlight nor overwrite the terminal status.
+-- =====================================================================
+do
+    local br = spyBreaker()
+    local p = pool.new({ items = { 'a', 'b' }, maxConcurrency = 2, breaker = br })
+    local da = p.nextDispatch(0); local db = p.nextDispatch(0)
+    assert_eq(p.state().inFlight, 2, "two in flight")
+    p.onResult('a', 'identified')
+    assert_eq(p.state().inFlight, 1, "one resolved")
+    -- duplicate completion for 'a' (already terminal) must be ignored.
+    p.onResult('a', 'fatal')
+    assert_eq(p.state().inFlight, 1, "duplicate onResult does NOT double-decrement inFlight")
+    assert_eq(p.terminalStatus().a, 'identified', "duplicate does NOT overwrite the terminal status")
+    -- b still in flight; resolving it reaches done.
+    p.onResult('b', 'identified')
+    assert_eq(p.state().inFlight, 0, "b resolved")
+    assert_eq(p.nextDispatch(0).action, 'done', "all real items resolved -> done")
+end
+
+-- =====================================================================
+-- N1: a fractional / sub-1 maxConcurrency is FLOORED + clamped to >= 1 in the controller.
+-- =====================================================================
+do
+    local br = spyBreaker()
+    -- 2.9 floors to 2: exactly two may be in flight at once.
+    local p = pool.new({ items = { 'a', 'b', 'c' }, maxConcurrency = 2.9, breaker = br })
+    p.nextDispatch(0); p.nextDispatch(0)
+    assert_eq(p.state().inFlight, 2, "maxConcurrency 2.9 floored to 2 (two in flight)")
+    assert_eq(p.nextDispatch(0).action, 'idle', "third blocked: floor(2.9)==2 slots full")
+
+    -- 0.5 / 0 / negative all clamp to 1.
+    local p2 = pool.new({ items = { 'a', 'b' }, maxConcurrency = 0.5, breaker = spyBreaker() })
+    p2.nextDispatch(0)
+    assert_eq(p2.state().inFlight, 1, "maxConcurrency 0.5 clamps to 1")
+    assert_eq(p2.nextDispatch(0).action, 'idle', "only one slot when clamped to 1")
+end
