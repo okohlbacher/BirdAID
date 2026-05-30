@@ -1,0 +1,37 @@
+name: CI
+
+# Runs the pure-Lua test suite (outside Lightroom) under both a stock Lua and LuaJIT,
+# then exercises the release packaging gates. The plugin's pure core imports no Lr* and
+# is written in the Lua 5.1 common subset, so it runs unchanged on any interpreter.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test suite + packaging gates
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Lua + LuaJIT
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 luajit
+          # The runner and tools/build.sh invoke the interpreter as `lua`.
+          sudo ln -sf "$(command -v lua5.4)" /usr/local/bin/lua
+          lua -v
+          luajit -v
+
+      - name: Run test suite (lua)
+        run: lua test/run.lua
+
+      - name: Run test suite (luajit)
+        run: luajit test/run.lua
+
+      - name: Build .lrplugin (packaging gates)
+        run: bash tools/build.sh

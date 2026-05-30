@@ -55,11 +55,13 @@ what the AI was and was not sure of, rather than receiving a silent wrong answer
 
 ## Status
 
-v0.9 — pre-release. macOS only for v1.
+v1.0 — macOS only.
 
-The core end-to-end pipeline (preview fetch → vision ID → flat keyword write-back)
-is working with all three providers. The experimental crop-for-ID pass is present but
-off by default pending spike verification.
+The core end-to-end pipeline (preview fetch → vision ID → flat keyword write-back) is
+verified end-to-end with **OpenAI** (including idempotent re-runs that never clobber your
+keywords). **Claude** and **Gemini** are implemented behind the same provider interface and
+covered by the offline test suite; switch to them in settings. The experimental crop-for-ID
+pass is present but off by default pending spike verification.
 
 ---
 

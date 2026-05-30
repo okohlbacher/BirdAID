@@ -90,7 +90,7 @@ end
 -- the real item now that the temporary Debug* harness entries were stripped for the v0.9 release.
 assert_eq(#relItems, 1, "release manifest registers exactly the one real menu item")
 
--- ---- VERSION set for the v0.9 pre-release ----
+-- ---- VERSION set for the v1.0 release ----
 assert_true(type(rel.VERSION) == "table", "release VERSION is a table")
-assert_eq(rel.VERSION.major, 0, "release VERSION.major is 0 (pre-1.0)")
-assert_eq(rel.VERSION.minor, 9, "release VERSION.minor is 9 (v0.9 pre-release)")
+assert_eq(rel.VERSION.major, 1, "release VERSION.major is 1 (v1.0)")
+assert_eq(rel.VERSION.minor, 0, "release VERSION.minor is 0 (v1.0)")

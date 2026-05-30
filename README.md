@@ -1,7 +1,8 @@
 # BirdAID
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Build](https://img.shields.io/badge/build-passing-brightgreen.svg)
+[![CI](https://github.com/okohlbacher/BirdAID/actions/workflows/ci.yml/badge.svg)](https://github.com/okohlbacher/BirdAID/actions/workflows/ci.yml)
+![Platform: macOS](https://img.shields.io/badge/platform-macOS-lightgrey.svg)
 
 **Automatically identify and keyword the birds in your Lightroom Classic library.**
 
@@ -10,7 +11,8 @@ photos, detects whether each contains a bird, identifies the species using a
 configurable vision-AI backend, and writes the result back into your catalog as
 keywords — without ever touching your existing data.
 
-> **v0.9 — pre-release. macOS only for v1.**
+> **v1.0 — macOS only.** OpenAI is the fully verified provider; Claude and Gemini are
+> implemented behind the same interface. The crop-for-ID pass is experimental and off by default.
 
 ---
 
