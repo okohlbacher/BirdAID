@@ -11,8 +11,11 @@ photos, detects whether each contains a bird, identifies the species using a
 configurable vision-AI backend, and writes the result back into your catalog as
 keywords — without ever touching your existing data.
 
-> **v1.0 — macOS only.** OpenAI is the fully verified provider; Claude and Gemini are
-> implemented behind the same interface. The crop-for-ID pass is experimental and off by default.
+> **v1.0.** OpenAI is the fully verified provider; Claude and Gemini are implemented behind the
+> same interface. No external tools — runs on macOS and Windows (macOS is the primary tested platform).
+>
+> **⚠️ Privacy:** to identify a photo, BirdAID uploads a **downsampled JPEG preview** of it (never
+> the original full-resolution file) to your chosen third-party AI provider.
 
 ---
 
@@ -40,8 +43,8 @@ possible. Honestly uncertain when not.**
 - **GPS + date regional prior** — passes coordinates and capture date to the AI to narrow the candidate species list. ON by default; disclosed and toggleable.
 - **Privacy-first logging** — the log sink automatically redacts API keys, GPS coordinates, and filesystem paths before writing anything to disk.
 - **Run-level circuit breaker** — stops the run early if the API sustains a quota outage across multiple photos, rather than burning cost for no benefit.
-- **Experimental crop-for-ID** — optional second pass using a tight full-resolution crop of the detected bird region, for sharper identifications. macOS + ImageMagick only, off by default.
-- **Pure-Lua test suite** — over 1,800 assertions covering all pure logic, runnable outside Lightroom with `lua test/run.lua`.
+- **Parallel + clustering (optional)** — process several photos at once, and collapse near-duplicate bursts to a single identification. Both off by default; no external tools.
+- **Pure-Lua test suite** — 2,700+ assertions covering all pure logic, runnable outside Lightroom with `lua test/run.lua`.
 
 ---
 
@@ -93,9 +96,6 @@ Select photos in LrC
         |
         v
   Response validate    contract.validateResponse (every response, every provider)
-        |
-        v
-  [Optional crop]      Export full-res → external crop tool → re-query same provider
         |
         v
   Write plan           Pure: decide keyword per detection, diff against existing names

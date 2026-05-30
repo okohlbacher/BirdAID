@@ -71,7 +71,7 @@ identify(image, ctx) -> (response_table) | (nil, err)
 {
   kind   = 'bytes' | 'file',
   data   = <non-empty string>,   -- when kind == 'bytes'
-  path   = <non-empty string>,   -- when kind == 'file' (crop re-query)
+  path   = <non-empty string>,   -- when kind == 'file'
   dataUrl = <string>,            -- set by http.attachImage; data: URL for OpenAI
   b64     = <string>,            -- set by http.attachImage; raw base64 for Claude/Gemini
   width  = <number>,             -- exact decoded frame width
@@ -136,9 +136,9 @@ names return `(nil, 'provider-not-implemented:…')`.
 | `src/net/breaker.lua` | Run-level circuit breaker. Opens after 5 consecutive per-photo retry exhaustions. |
 | `src/settings.lua` | Provider/model catalog, prefs defaults, `normalizedPrefs`, `toBool`, `sanitizePathHint`, token classification. |
 | `src/redact.lua` | `redact(s)`. Value-only and key-aware secret/PII masking. Lua patterns only (no PCRE). |
-| `src/platform.lua` | `capabilities(osToken)`. Pure OS-token → crop capability mapping. |
-| `src/crop/bbox_transform.lua` | Normalized bbox → pixel rect for the crop pass. |
-| `src/crop/merge.lua` | Per-detection merge of preview and crop results. |
+| `src/orchestrate.lua` | PURE Wave-3 composition: `featuresOff` bypass predicate, `buildFrames`, `runFeatures`, `dispatch`, results→writeplan adapter. |
+| `src/cluster/group.lua`, `similarity.lua`, `jpeg_thumb.lua` | Burst/stack clustering: grouping; 64-bit aHash; pure-Lua DC-luma thumbnail decode. |
+| `src/net/worker_gate.lua`, `src/results.lua`, `src/viz/svg.lua` | Per-call cancel/breaker gate; per-photo result model; SVG detection report. |
 
 ---
 
@@ -150,7 +150,7 @@ names return `(nil, 'provider-not-implemented:…')`.
 | `src/lr/preview_fetch.lua` | `fetch(photo, maxEdge, opts)`. Async JPEG preview via `requestJpegThumbnail`. |
 | `src/lr/metadata_reader.lua` | `read(photo)`, `formattedFileName(photo)`. Reads GPS, date, and formatted name from an LrPhoto. |
 | `src/lr/catalog_writer.lua` | `readExistingNames(photo)`, `apply(catalog, plan, …)`. Add-only keyword write-back inside a single `withWriteAccessDo` gate. |
-| `src/lr/cropper.lua` | Export full-res via `LrExportSession`, invoke `magick` crop via `LrTasks.execute`. |
+| `src/lr/staged_pool.lua` | Parallel driver: serial preview fetch (producer) + bounded parallel gated AI calls (consumers). |
 | `src/log.lua` | Single LrLogger sink. Composes, redacts, and emits structured log lines. The only `src/` file that imports `Lr*`. |
 
 ---
@@ -180,14 +180,12 @@ The transport layer (`src/lr/http.lua`) calls `LrHttp.post` **without** a surrou
 
 `IdentifyBirds.lua` is the real end-to-end orchestration entry. Its lifecycle:
 
-1. **Setup** — read and normalize prefs; resolve OS capabilities; build deps once
-   (`http.buildDeps`); resolve the provider (`providers.get`); validate the crop tool
-   if crop is enabled.
+1. **Setup** — read and normalize prefs; build deps once (`http.buildDeps`); resolve
+   the provider (`providers.get`).
 2. **Collect phase** (entirely outside any write gate) — for each photo:
    - Fetch JPEG preview (`previewFetch.fetch`).
    - Read metadata and shape the AI context (`metadataReader.read` + `metadata.shape`).
    - Call `provider.identify(previewImage, ctx)`.
-   - Optionally: run the crop pass (export full-res → crop → re-query → merge).
    - Accumulate a results table.
    - Check the run-level breaker; break if open.
    - Sleep the rate-limit delay between photos.
@@ -221,7 +219,7 @@ The runner:
 
 Spec files cover: keyword rendering and decision logic, contract validation, backoff
 policy, breaker state machine, settings validation and sanitization, redaction, prompt
-building, metadata shaping, bbox transform, crop merge, fake provider, all three live
+building, metadata shaping, clustering + thumbnail decode, fake provider, all three live
 providers against fixtures, the e2e fake pipeline, and more.
 
 The fake provider (`src/providers/fake.lua`) and fixture files in `test/fixtures/`

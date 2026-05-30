@@ -12,12 +12,17 @@ run your first identification, and understand what you get back.
 
 ## Requirements
 
-- **macOS** — BirdAID v1 is macOS-only. The plug-in loads on other platforms, but
-  the experimental crop-for-ID pass is disabled off-macOS, and only macOS is
-  tested for the full pipeline.
 - **Adobe Lightroom Classic** — SDK target LrC 14.0; minimum supported LrC 6.0.
+  BirdAID is pure Lua + the LrC SDK with **no external tools**, so it runs on **macOS and
+  Windows** (macOS is the primary tested platform; Windows is not yet formally verified).
 - **A paid API key** — live identifications call a paid vision API. BirdAID does
   not bundle any AI access; you supply your own key. The default provider is OpenAI.
+
+> **⚠️ Privacy — your images are uploaded for identification.** To identify a photo, BirdAID
+> sends a **downsampled JPEG preview** of it (and, if enabled, its GPS coordinates + capture
+> date) to the third-party AI provider you choose. The original full-resolution file is never
+> uploaded, but the preview is. If that isn't acceptable for a given photo, don't run BirdAID
+> on it. See [Privacy and GPS](#privacy-and-gps).
 
 ---
 
@@ -170,9 +175,15 @@ allowlist of country names can ever appear in the hint.
 To enable: **File > Plug-in Manager > BirdAID settings > check "Include location
 hint from file path"**.
 
+### What is sent to the AI
+
+- A **downsampled JPEG preview** of each processed photo (never the original full-resolution file).
+- If enabled (ON by default): the photo's **GPS coordinates and capture date**, as a regional prior.
+- If enabled (OFF by default): a coarse **location hint** derived from the file path.
+
 ### What is never sent or logged
 
-- Your API key. It lives only in the macOS Keychain.
+- Your API key. It lives only in the macOS/Windows Keychain.
 - Your raw file paths or drive names.
 - Your username or home directory.
 - Precise GPS coordinates are automatically redacted from log output by the logging
@@ -182,16 +193,14 @@ hint from file path"**.
 
 ## Cost
 
-Every photo you process makes at least one API call (preview-based). If the
-experimental crop-for-ID pass is enabled, each detected bird triggers a second call
-on the crop. Large selections or frequent runs incur API charges with the provider
-you have chosen.
+Every photo you process makes one API call (on its downsampled preview). Large
+selections or frequent runs incur API charges with the provider you have chosen.
 
 Controls to manage cost:
 
 - **Model** — smaller/cheaper models (e.g. `gpt-4o-mini`) reduce per-call cost.
-- **Rate limit** — configurable inter-call delay (default 1 second) prevents fast
-  exhaustion of rate quotas on large selections.
+- **Burst/stack clustering** — identify one photo per near-duplicate burst and copy its
+  keyword to the rest (see below), so a long burst costs one call instead of many.
 - **Dry run** — enable dry run in settings to see what keywords BirdAID _would_ write
   without making any API calls or changing your catalog. Useful for testing.
 
@@ -205,12 +214,11 @@ photos one at a time exactly as before.
 
 ### Parallel requests
 
-**Max parallel requests** (1–50, default **1**) controls how many photos are sent to the
-AI at once. Bird identification is dominated by network round-trip time, so raising this
-makes large selections much faster. The rate limit still applies as an **aggregate** cap
-across all in-flight requests, so you won't exceed your provider's limit — but set a
-conservative value if your rate limit is 0 (unlimited), since up to *N* requests can be in
-flight before a sustained-outage cutoff kicks in. Start with 4–8.
+**Number of parallel requests** (1–50, default **1**) controls how many photos are sent to
+the AI at the same time. Identification is dominated by network round-trip time, so raising
+this makes large selections much faster. If your provider rejects requests for arriving too
+fast, BirdAID automatically backs off and retries — so just lower the number a little.
+Start with 4–8. (There is no separate rate-limit setting; this single control governs speed.)
 
 ### Burst / stack clustering
 
@@ -231,29 +239,6 @@ anchor fails, its cluster is deferred (nothing written) and retried on the next 
 box over the photo and opens it in your browser after the run (hover a box for the species
 and confidence). It is purely a viewer — it writes a temporary file on your disk and never
 uploads anything. Off by default; requires no extra tools.
-
----
-
-## Experimental crop-for-ID pass
-
-When enabled, BirdAID exports a tight full-resolution crop of the detected bird
-region and sends it to the AI as a second, sharper identification attempt. The crop
-is transient and is never saved as a deliverable file.
-
-**Status: EXPERIMENTAL and OFF by default.**
-
-Enabling the crop pass requires:
-
-1. **macOS** — the crop pass is macOS-only (it uses an external command-line tool
-   with POSIX quoting that does not work on Windows).
-2. **ImageMagick v7** — install via Homebrew: `brew install imagemagick`. The `magick`
-   binary must be reachable at an absolute path (e.g. `/opt/homebrew/bin/magick`).
-3. In **Plug-in Manager > BirdAID settings**:
-   - Enable "Crop-for-ID (experimental)".
-   - Enter the absolute path to the `magick` binary.
-
-The crop pass is validated before each run; if the tool is missing or the path is
-invalid, crop is silently disabled for that run and the preview-only result is used.
 
 ---
 
@@ -292,8 +277,8 @@ selected, and save your key.
 A `429` with "insufficient_quota" means your OpenAI account has no remaining API
 credit. Add credit at [platform.openai.com/account/billing](https://platform.openai.com/account/billing).
 
-A `429` with "rate_limit_exceeded" means you are sending requests too fast. Increase
-the rate limit delay in settings.
+A `429` with "rate_limit_exceeded" means you are sending requests too fast. Lower the
+**Number of parallel requests** in settings (BirdAID also backs off and retries automatically).
 
 BirdAID has a built-in exponential backoff (up to 4 attempts per photo, max 30-second
 wait) and a run-level circuit breaker that stops the run early if multiple consecutive
@@ -308,12 +293,6 @@ prompted), then reopen the BirdAID settings panel.
 
 Check the dry run toggle. If "Dry run" is enabled in settings, BirdAID logs the plan
 but does not write anything to the catalog.
-
-**Crop-for-ID not working**
-
-Ensure you are on macOS, ImageMagick v7 (`magick`) is installed, and the exact
-absolute path is entered in settings. Check the log for a "crop disabled" or
-"crop tool unavailable" message that will explain which validation failed.
 
 ---
 

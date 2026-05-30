@@ -32,15 +32,19 @@ what the AI was and was not sure of, rather than receiving a silent wrong answer
 BirdAID does **not** include or bundle an AI model. The actual species identification is done by a
 **vision-capable AI** that you connect with your **own API key**. To run BirdAID you need:
 
-- **Adobe Lightroom Classic** on **macOS** (v1 is macOS-only).
+- **Adobe Lightroom Classic** (macOS or Windows — BirdAID needs no external tools; macOS is the
+  primary tested platform, Windows not yet formally verified).
 - An **API key** from one of the supported AI providers below — a paid account, billed per use
   (typically a fraction of a cent to a few cents per photo, depending on provider, model, and
   image size).
-- _(Optional)_ **ImageMagick**, only if you enable the experimental crop-for-ID pass.
 
 **Why bring your own key?** It keeps *you* in control of cost, model choice, and data. Your key is
-stored only in the **macOS Keychain** — never in the plug-in's preferences or logs — and each image
+stored only in the OS **Keychain** — never in the plug-in's preferences or logs — and each image
 goes directly from Lightroom to the provider you chose. There is no BirdAID server in the middle.
+
+> **⚠️ Privacy:** to identify a photo, BirdAID uploads a **downsampled JPEG preview** of it (never
+> the original full-resolution file) to your chosen third-party AI provider — plus, if enabled, its
+> GPS coordinates + capture date. Don't run it on photos you can't share that way.
 
 > A key needs **available quota/credit.** A key with no credit returns an authentication/quota
 > error, which BirdAID surfaces clearly (rather than silently reporting "no birds found").
@@ -80,9 +84,8 @@ choosing.
   and filesystem paths automatically; nothing sensitive reaches the log file.
 - **Run-level circuit breaker** — if the API sustains a quota outage across multiple
   photos, the run stops early and defers remaining photos rather than burning quota.
-- **Experimental crop-for-ID pass** — on macOS with ImageMagick installed, an
-  optional second pass crops to the detected bird region and re-queries the AI for a
-  sharper identification. Off by default.
+- **Parallel + clustering (optional)** — process several photos at once, and collapse
+  near-duplicate bursts to one identification. Both off by default; no external tools.
 - **Pure-Lua test suite** — over 1,800 assertions covering keyword rendering, decision
   logic, contract validation, bbox math, prompt building, backoff, and more. Runs
   outside Lightroom with `lua test/run.lua`.
@@ -91,13 +94,12 @@ choosing.
 
 ## Status
 
-v1.0 — macOS only.
+v1.0. No external tools — runs on macOS and Windows (macOS is the primary tested platform).
 
 The core end-to-end pipeline (preview fetch → vision ID → flat keyword write-back) is
 verified end-to-end with **OpenAI** (including idempotent re-runs that never clobber your
 keywords). **Claude** and **Gemini** are implemented behind the same provider interface and
-covered by the offline test suite; switch to them in settings. The experimental crop-for-ID
-pass is present but off by default pending spike verification.
+covered by the offline test suite; switch to them in settings.
 
 ---
 
