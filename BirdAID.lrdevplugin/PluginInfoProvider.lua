@@ -258,7 +258,7 @@ local function sectionsForTopOfDialog(f, propertyTable)
                             -- The error message MUST NOT contain the token value.
                             LrDialogs.message(
                                 "Could not save token",
-                                "The macOS Keychain rejected the save (it may be locked). " ..
+                                "The system keychain rejected the save (it may be locked). " ..
                                 "Try again after unlocking.",
                                 "critical")
                         end

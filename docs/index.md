@@ -5,7 +5,7 @@ title: BirdAID
 
 # BirdAID
 
-**BirdAID** is a macOS plug-in for Adobe Lightroom Classic (LrC) that scans your
+**BirdAID** is a plug-in for Adobe Lightroom Classic (LrC) — macOS and Windows — that scans your
 selected photos, detects whether each image contains a bird, identifies the species
 using a configurable vision-AI backend, and writes the result back into your catalog
 as keywords — without ever touching your existing keywords.
@@ -77,7 +77,7 @@ choosing.
 - **Add-only write-back** — never removes, renames, or replaces your existing keywords.
   Re-running on the same photos is always safe.
 - **Three vision-AI providers** — OpenAI (default, `gpt-4o`), Claude (Anthropic),
-  and Gemini (Google). You supply your own API key, stored only in the macOS Keychain.
+  and Gemini (Google). You supply your own API key, stored only in the OS keychain.
 - **GPS + date regional prior** — passes coordinates and capture date to the AI to
   narrow the candidate species list. ON by default; can be turned off in settings.
 - **Privacy-first logging** — the logging sink redacts API keys, GPS coordinates,

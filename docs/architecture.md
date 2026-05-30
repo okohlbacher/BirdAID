@@ -94,7 +94,7 @@ table injected by the Lr glue (`src/lr/http.lua` → `buildDeps`):
 deps = {
   token        : string,          -- API key (used only to build auth headers)
   model        : string,
-  rateLimit    : number,          -- seconds (surfaced; orchestrator sleeps)
+  rateLimit    : number?,         -- legacy/optional; the entry no longer rate-limits (parallel count only)
   httpPost     : function,        -- the LrHttp.post wrapper
   sleep        : function,        -- LrTasks.sleep
   log          : table,           -- the src.log sink
@@ -188,7 +188,6 @@ The transport layer (`src/lr/http.lua`) calls `LrHttp.post` **without** a surrou
    - Call `provider.identify(previewImage, ctx)`.
    - Accumulate a results table.
    - Check the run-level breaker; break if open.
-   - Sleep the rate-limit delay between photos.
 3. **Plan** — `writeplan.planReport(results, prefs)` builds the add-only write plan
    and summary from the collected results. Pure; no Lr.
 4. **Write** — if not dry-run, `catalogWriter.apply(…)` applies the plan inside a
@@ -231,7 +230,7 @@ a Lightroom installation or an API key.
 ## Adding a new provider backend
 
 1. **Pure provider module** — create `src/providers/<name>.lua`. Follow the OpenAI
-   provider pattern: `new(deps)` returns `{ identify, rateLimit }`. The module must
+   provider pattern: `new(deps)` returns `{ identify }` (a `rateLimit` field is optional/legacy). The module must
    import no `Lr*`, use `deps.httpPost` / `deps.sleep` / `deps.log` / `deps.authHeaders`
    for all I/O, and return a `contract.validateResponse`-valid response or `(nil, err)`.
 

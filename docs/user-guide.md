@@ -47,7 +47,7 @@ development setup.
 A plain **Reload** in Plug-in Manager does NOT pick up manifest changes. When
 upgrading to a new version, **Remove** the old entry and then **Add** the new
 folder again. Your API key and settings are preserved because they are stored
-under a stable identifier in the macOS Keychain and Lightroom prefs respectively.
+under a stable identifier in the OS keychain and Lightroom prefs respectively.
 
 ---
 
@@ -87,7 +87,7 @@ structured-output behavior and is the most thoroughly tested path.
 3. Choose a **Model** from the dropdown, or type a custom model name.
 4. Paste your API key into the key entry field and click **Save Key**.
 
-Your key is stored **only in the macOS Keychain**, scoped to the BirdAID plug-in
+Your key is stored **only in the OS keychain** (Keychain on macOS, Credential Manager on Windows), scoped to the BirdAID plug-in
 identifier. It is never written to any Lightroom preference file, settings file, or
 log. The settings panel is the only supported entry point for the key.
 
@@ -201,8 +201,9 @@ Controls to manage cost:
 - **Model** — smaller/cheaper models (e.g. `gpt-4o-mini`) reduce per-call cost.
 - **Burst/stack clustering** — identify one photo per near-duplicate burst and copy its
   keyword to the rest (see below), so a long burst costs one call instead of many.
-- **Dry run** — enable dry run in settings to see what keywords BirdAID _would_ write
-  without making any API calls or changing your catalog. Useful for testing.
+- **Dry run** — preview the keywords BirdAID _would_ write **without changing your catalog**.
+  Note: dry run **still calls the AI** (and still uploads previews), so it still incurs API cost —
+  it only skips the catalog write. Use it to check results safely, not to avoid charges.
 
 ---
 

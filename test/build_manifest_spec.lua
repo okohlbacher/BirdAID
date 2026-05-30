@@ -54,8 +54,8 @@ assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/PluginInfoProvider.lua"), false,
     "PluginInfoProvider.lua ships")
 assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/birdaid_bootstrap.lua"), false,
     "birdaid_bootstrap.lua ships")
-assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/src/platform.lua"), false,
-    "src/platform.lua ships")
+assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/src/orchestrate.lua"), false,
+    "src/orchestrate.lua ships")
 assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/src/lr/catalog_writer.lua"), false,
     "src/lr/* ships")
 assert_eq(bm.isDevOnly("BirdAID.lrdevplugin/src/providers/openai.lua"), false,

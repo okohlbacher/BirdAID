@@ -16,7 +16,7 @@
 --
 -- SHIPPED (NOT dev-only) = the real plugin sources: Info.lua, IdentifyBirds.lua,
 -- PluginInfoProvider.lua, birdaid_bootstrap.lua, and everything under src/ (incl.
--- src/platform.lua, src/lr/*, src/providers/*, src/crop/*, src/net/*, src/lib/dkjson).
+-- src/lr/*, src/providers/*, src/cluster/*, src/viz/*, src/net/*, src/crop/sweep.lua, src/lib/dkjson).
 --
 -- Strictly Lua 5.1 common subset.
 

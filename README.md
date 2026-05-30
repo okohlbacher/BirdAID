@@ -6,7 +6,7 @@
 
 **Automatically identify and keyword the birds in your Lightroom Classic library.**
 
-BirdAID is a macOS plug-in for Adobe Lightroom Classic (LrC) that scans your selected
+BirdAID is a plug-in for Adobe Lightroom Classic (LrC), on macOS and Windows, that scans your selected
 photos, detects whether each contains a bird, identifies the species using a
 configurable vision-AI backend, and writes the result back into your catalog as
 keywords — without ever touching your existing data.
@@ -53,7 +53,7 @@ possible. Honestly uncertain when not.**
 1. [Download the latest release](#install), unzip, and add `BirdAID.lrplugin` in
    **File > Plug-in Manager > Add**.
 2. In the plug-in settings, choose your provider (OpenAI is the default), pick a
-   model, and save your API key. The key is stored only in the macOS Keychain.
+   model, and save your API key. The key is stored only in the OS keychain (Keychain on macOS, Credential Manager on Windows) via Lightroom's secure password store.
 3. Select photos in the Library module.
 4. Run **Library > Plug-in Extras > Identify Birds in Selected Photos…**
 5. Review the keywords written to your catalog.
@@ -111,7 +111,7 @@ never runs inside `withWriteAccessDo`.
 
 ## Privacy
 
-**API key:** stored only in the macOS Keychain, scoped to the BirdAID plug-in
+**API key:** stored only in the OS keychain (Keychain on macOS, Credential Manager on Windows), scoped to the BirdAID plug-in
 identifier. Never written to any file, preference store, or log.
 
 **GPS and date:** sent to the AI provider by default as a regional prior. Disclosed
