@@ -197,6 +197,43 @@ Controls to manage cost:
 
 ---
 
+## Speed and batch features
+
+These are in the **Throughput & clustering** and **Detection report** sections of the
+settings panel. All three are **off by default** — with the defaults, BirdAID processes
+photos one at a time exactly as before.
+
+### Parallel requests
+
+**Max parallel requests** (1–50, default **1**) controls how many photos are sent to the
+AI at once. Bird identification is dominated by network round-trip time, so raising this
+makes large selections much faster. The rate limit still applies as an **aggregate** cap
+across all in-flight requests, so you won't exceed your provider's limit — but set a
+conservative value if your rate limit is 0 (unlimited), since up to *N* requests can be in
+flight before a sustained-outage cutoff kicks in. Start with 4–8.
+
+### Burst / stack clustering
+
+**Cluster bursts** groups consecutive near-duplicate frames, identifies **one** of them
+(the anchor), and **copies** its keyword to the rest — so a 20-frame burst of the same bird
+costs one API call, not twenty. A frame joins a cluster when it is within
+**Max gap seconds** (default 1.0) of the previous frame *or* in the same Lightroom **stack**
+(if **Use stacks** is on), **and** it looks similar on a coarse thumbnail (the **Similarity
+threshold**, a Hamming distance 0–64; lower = stricter). Similarity is computed entirely
+on-device (no extra API calls, no ImageMagick). A scene change inside the window breaks the
+cluster so it is identified on its own. Note: a coarse match cannot tell apart two *different*
+species framed identically — keep the threshold strict for mixed-species bursts. If the
+anchor fails, its cluster is deferred (nothing written) and retried on the next run.
+
+### Detection report
+
+**Open detection report** writes a small SVG showing each detected bird as a labelled blue
+box over the photo and opens it in your browser after the run (hover a box for the species
+and confidence). It is purely a viewer — it writes a temporary file on your disk and never
+uploads anything. Off by default; requires no extra tools.
+
+---
+
 ## Experimental crop-for-ID pass
 
 When enabled, BirdAID exports a tight full-resolution crop of the detected bird

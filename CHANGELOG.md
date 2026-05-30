@@ -18,13 +18,20 @@ First stable release. macOS only.
   species can't be confidently determined.
 - **Pluggable providers:** OpenAI (default, fully verified). Claude and Gemini are implemented
   behind the same interface and covered by the offline test suite — selectable in settings.
+- **Speed & batch (off by default):** optional **parallel requests** (Max parallel 1–50)
+  with a global token bucket so the aggregate provider-call rate still honors your rate limit;
+  optional **burst/stack clustering** that identifies one anchor per near-duplicate burst and
+  transfers its keyword to the rest (coarse on-device thumbnail similarity, no extra API calls,
+  no ImageMagick); and an optional **detection report** (an in-browser SVG of the detected
+  birds as labelled boxes). With all three off, processing is the same one-at-a-time path.
 - **Privacy & secrets:** the API token lives only in the macOS Keychain and is never logged;
   GPS/date are opt-in, disclosed, and redacted in logs; path hints are off by default.
 - **Resilient calls:** deterministic backoff + a run-level circuit breaker; quota/billing
   `429`s are surfaced as actionable errors instead of silently degrading.
 - **Tested:** a pure-Lua core (rendering, decision logic, schema/contract, bbox math, prompt
-  building, backoff, merge) with 2457 assertions passing under both `lua` and `luajit`,
-  plus release-packaging gates — all run in CI.
+  building, backoff, worker-pool gate, token bucket, clustering, JPEG-thumbnail decode, SVG,
+  merge) with 3000+ assertions passing under both `lua` and `luajit`, plus release-packaging
+  gates — all run in CI. Every change was adversarially code-reviewed (CODEX) before landing.
 
 ### Notes
 - The crop-for-ID pass (a tightened full-res re-query) is **experimental and off by default**;
