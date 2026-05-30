@@ -99,9 +99,25 @@ local function awaitThumbnail(photo, edge, opts)
 
     -- Issue the async request. The pure onCallback dedupes multi-fire callbacks (MUST-FIX
     -- 16) and records (nil,err) as a 'failed' status.
-    local req = photo:requestJpegThumbnail(edge, edge, function(jpeg, err)
-        preview.onCallback(st, jpeg, err)
+    --
+    -- CODEX SHOULD-FIX: GUARD the requestJpegThumbnail INITIATION. requestJpegThumbnail is
+    -- async/callback-based and is NOT expected to yield, so a STANDARD pcall around the INITIATION
+    -- is correct (we are NOT wrapping a yielding call — the cooperative LrTasks.sleep await below is
+    -- OUTSIDE this pcall, run on the task). If the SDK call raises BEFORE the callback/poll ever
+    -- runs, awaitThumbnail must return a clean ('failed' verdict) rather than propagating the raise —
+    -- matching the per-photo isolation fetch() promises. The error string is token/path/gps-free.
+    local okReq, req = pcall(function()
+        return photo:requestJpegThumbnail(edge, edge, function(jpeg, err)
+            preview.onCallback(st, jpeg, err)
+        end)
     end)
+    if not okReq then
+        -- The async initiation raised before any callback could fire. Record it as a callback-style
+        -- failure into the PURE state machine (its dedupe makes this idempotent) so decide() resolves
+        -- a TERMINAL 'failed' verdict immediately — no poll loop, no held ref to release.
+        preview.onCallback(st, nil, tostring(req))
+        return preview.decide(st, 0, false), st
+    end
 
     local startedAt = wallClockSeconds()
 

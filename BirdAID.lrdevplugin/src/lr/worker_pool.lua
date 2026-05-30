@@ -80,6 +80,12 @@ local M = {}
 -- string, and the worker classifies it as 'deferred' (NEVER 'fatal'/'identified').
 local DEFERRED_SENTINEL = { deferred = true }
 
+-- A sentinel the worker body raises when, AFTER the token wait, cooperative cancel is observed
+-- immediately before the provider call. It is a TABLE so it can never collide with a real provider
+-- error string. The worker classifies it as 'cancelled' (the provider is NEVER called); the pool
+-- controller resolves the item 'cancelled' and its cluster-followers cancel via the results join.
+local CANCELLED_SENTINEL = { cancelled = true }
+
 -- wallClockSeconds() -> a monotonically-advancing real-time seconds value (NOT CPU time).
 local function wallClockSeconds()
     if LrDate and LrDate.currentTime then
@@ -174,39 +180,58 @@ function M.run(opts)
     local responseByAnchorKey = {}
 
     -- advance the shared progress scope once per resolved item (single-threaded cooperative; no lock).
+    -- POOL-OWNED Lr CALL: setPortionComplete runs DIRECTLY on the worker's task (NOT inside a standard
+    -- pcall — that would be the yield-across-C-pcall hazard for a pool-owned Lr call). It does not yield,
+    -- but we wrap it in the INJECTED yield-safe pcall (ypcall) as a defensive guard so an absent/throwing
+    -- method can never crash the worker (NEVER a standard pcall for a pool-owned Lr call).
     local total = #items
     local resolved = 0
     local function advanceProgress()
         resolved = resolved + 1
         if progress and progress.setPortionComplete then
-            pcall(function() progress:setPortionComplete(resolved, total) end)
+            ypcall(function() progress:setPortionComplete(resolved, total) end)
         end
     end
 
     -- ---- one worker's per-item body (runs INSIDE the yield-safe pcall) -------------------------
-    -- Returns (response, err); RAISES DEFERRED_SENTINEL when the after-token breaker gate is open.
+    -- Returns (response, err); RAISES CANCELLED_SENTINEL when cancel is observed after the token wait,
+    -- or DEFERRED_SENTINEL when the after-token breaker gate is open. ORDER (BLOCKER C + B):
+    --   acquireToken -> (isCanceled? -> cancelled) -> (shouldStop? -> deferred) -> else identifyFn.
     local function workerBody(item)
         -- (1) TAKE A TOKEN (per-provider-call cost). LrTasks.sleep yields — pinned inside ypcall.
+        --     bucket.take itself may LrTasks.sleep up to 1/rate, so cancel/breaker may flip DURING it.
         acquireToken(bucket, LrTasks.sleep)
-        -- (2) AFTER-TOKEN BREAKER GATE: re-read shouldStop immediately before the provider call. If
+        -- (2a) AFTER-TOKEN CANCEL GATE (BLOCKER B): re-check cooperative cancel IMMEDIATELY before the
+        -- provider call. A worker can sleep waiting for a token while cancel happens mid-wait; without
+        -- this re-check it would pass the breaker gate and still call the provider. If cancelled now,
+        -- do NOT call the provider — raise the cancelled sentinel so the worker classifies the item
+        -- 'cancelled' (its followers cancel via the results join). A token already taken just paces.
+        if safeCanceled(isCanceled) then
+            error(CANCELLED_SENTINEL)
+        end
+        -- (2b) AFTER-TOKEN BREAKER GATE: re-read shouldStop immediately before the provider call. If
         -- open, do NOT call the provider — raise the deferred sentinel so the worker classifies the
         -- item 'deferred' (NEVER 'identified', even though the provider would return a valid degrade).
         if breakerOpen(breaker) then
             error(DEFERRED_SENTINEL)
         end
         -- (3) CALL THE PROVIDER. identifyFn closes over the preview fetch + provider.identify (+ any
-        -- crop re-query, each of which takes its OWN token + re-checks shouldStop via the shared
-        -- bucket/breaker the orchestrator threaded in).
+        -- crop re-query, each of which takes its OWN token + re-checks cancel + shouldStop via the
+        -- shared isCanceled/bucket/breaker the orchestrator threaded in).
         return identifyFn(item)
     end
 
     -- classify a worker body's outcome into a pool terminal status + the collected (response,err).
-    -- ok=false + err==DEFERRED_SENTINEL -> 'deferred'; ok=false (any other err) -> 'fatal' (an
-    -- isolated per-item failure, never aborts the run); ok=true + response -> 'identified';
+    -- ok=false + err==CANCELLED_SENTINEL -> 'cancelled' (cancel observed after the token wait, before
+    -- the provider call); ok=false + err==DEFERRED_SENTINEL -> 'deferred'; ok=false (any other err) ->
+    -- 'fatal' (an isolated per-item failure, never aborts the run); ok=true + response -> 'identified';
     -- ok=true + (nil,err) -> 'fatal'. Only 'identified' carries a response into responseByAnchorKey.
     local function classify(item, ok, a, b)
         if not ok then
-            -- a is the raised error (the sentinel table OR an error string/object).
+            -- a is the raised error (a sentinel table OR an error string/object).
+            if a == CANCELLED_SENTINEL then
+                return 'cancelled', nil, nil
+            end
             if a == DEFERRED_SENTINEL then
                 return 'deferred', nil, nil
             end

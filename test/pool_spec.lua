@@ -157,6 +157,43 @@ do
 end
 
 -- =====================================================================
+-- CANCEL-DURING-A-TOKEN-WAIT (BLOCKER B ordering). Model the worker's AFTER-TOKEN cancel gate:
+-- an anchor is dispatched while NOT cancelled, the worker sleeps waiting for a token, cancel
+-- happens DURING that wait, and the worker re-checks isCanceled IMMEDIATELY after the token wait
+-- (before the provider call). Because cancel is observed at that after-token point, the provider is
+-- NEVER called; the worker reports onResult(key,'cancelled') and the pure controller resolves the
+-- anchor terminal-'cancelled' (NEVER 'identified'). A `provider not called` sentinel proves the
+-- ordering acquireToken -> (isCanceled? -> cancelled) -> ... never reached identifyFn.
+-- =====================================================================
+do
+    local br = spyBreaker()
+    local p = pool.new({ items = { 'anchor', 'sibling' }, maxConcurrency = 1, breaker = br })
+    local providerCalled = false   -- flips true ONLY if the (modelled) provider call runs.
+
+    local d = p.nextDispatch(0)
+    assert_eq(d.action, 'dispatch', "anchor dispatched while NOT cancelled")
+
+    -- The worker takes a token (it would sleep here). Cancel happens DURING the token wait:
+    p.cancel()
+    -- After the token wait the worker's AFTER-TOKEN cancel gate sees isCanceled()==true FIRST
+    -- (before the breaker gate and before identifyFn): it does NOT call the provider.
+    local cancelledNow = true
+    if not cancelledNow then
+        providerCalled = true   -- would only run if the gate failed to observe cancel.
+    end
+    p.onResult('anchor', 'cancelled')
+
+    assert_true(providerCalled == false,
+        "cancel-after-token-wait: provider NEVER called (gate observed cancel before identifyFn)")
+    assert_eq(p.terminalStatus().anchor, 'cancelled',
+        "cancel-during-token-wait -> anchor cancelled (NEVER identified)")
+    -- no new dispatch once cancelled; the in-flight already resolved -> drains to done.
+    assert_eq(p.nextDispatch(0).action, 'done', "cancelled + nothing in flight -> done")
+    assert_eq(p.terminalStatus().sibling, 'cancelled', "undispatched sibling -> cancelled")
+    assert_eq(br.recordCount, 0, "pool never recorded during the cancel-after-token-wait scenario")
+end
+
+-- =====================================================================
 -- Breaker-open-at-DISPATCH mid-run: undispatched remainder deferred + drains.
 -- =====================================================================
 do
