@@ -11,6 +11,11 @@
 --   transport = { kind='bytes', data=<jpeg bytes>, width=<int>, height=<int> }
 --   reason    = 'failed' | 'timeout' | 'cancelled' | 'bad-preview-dims'
 --
+-- fetchThumbBytes(photo, edge, opts) -> jpegBytes | (nil, reason)   [Phase 9 — BL-07 clustering]
+--   A SMALL >=128px thumbnail fetch returning RAW JPEG BYTES for the PURE cluster decoder
+--   (src.cluster.jpeg_thumb). It reuses the EXACT cooperative wait-loop fetch() uses (extracted
+--   into the local awaitThumbnail helper so fetch() behavior is unchanged).
+--
 -- It implements 03-RESEARCH Pattern 3, hardened per CODEX, and delegates ALL decision
 -- logic to the pure src.preview state machine (newState/onCallback/decide) + the pure
 -- parseJpegDims. The ONLY Lr work here is: issue the async requestJpegThumbnail, hold the
@@ -80,24 +85,21 @@ local function safeCancelled(opts)
     return (okc and cancelled) or false
 end
 
--- fetch(photo, maxEdge, opts) -> { kind='bytes', data, width, height } | (nil, reason)
---   opts (optional) = {
---     isCanceled = function() -> boolean,   -- e.g. function() return progress:isCanceled() end
---     timeoutMs  = <number>,                -- override the 8000ms default
---     file       = <string>,                -- pre-computed FORMATTED filename for logs (loggable)
---     runId      = <string>,                -- run correlation id for logs
---   }
-function M.fetch(photo, maxEdge, opts)
-    opts = opts or {}                                  -- MUST-FIX 2
+-- awaitThumbnail(photo, edge, opts) -> (verdict, state)  [shared cooperative wait-loop]
+--
+-- The ONE place that issues photo:requestJpegThumbnail, holds the request ref for the whole
+-- poll loop, drives the PURE preview state machine with wall-clock elapsed-ms + a guarded cancel
+-- signal, and returns the TERMINAL verdict ('ready'|'failed'|'timeout'|'cancelled') plus the pure
+-- state (st.jpeg holds the bytes on 'ready'; st.err the error on 'failed'). Extracted verbatim
+-- from the original fetch() body so fetch()'s behavior is UNCHANGED — fetchThumbBytes reuses the
+-- IDENTICAL loop. All MUST-FIX hardening (2/16/17) lives here once.
+local function awaitThumbnail(photo, edge, opts)
     local timeoutMs = type(opts.timeoutMs) == 'number' and opts.timeoutMs or DEFAULT_TIMEOUT_MS
-    local file      = type(opts.file) == 'string' and opts.file or '(unknown file)'
-    local runId     = opts.runId
-
     local st = preview.newState(timeoutMs)
 
     -- Issue the async request. The pure onCallback dedupes multi-fire callbacks (MUST-FIX
     -- 16) and records (nil,err) as a 'failed' status.
-    local req = photo:requestJpegThumbnail(maxEdge, maxEdge, function(jpeg, err)
+    local req = photo:requestJpegThumbnail(edge, edge, function(jpeg, err)
         preview.onCallback(st, jpeg, err)
     end)
 
@@ -117,6 +119,22 @@ function M.fetch(photo, maxEdge, opts)
 
     -- Terminal verdict reached: release the held request ref now (and only now).
     req = nil
+    return verdict, st
+end
+
+-- fetch(photo, maxEdge, opts) -> { kind='bytes', data, width, height } | (nil, reason)
+--   opts (optional) = {
+--     isCanceled = function() -> boolean,   -- e.g. function() return progress:isCanceled() end
+--     timeoutMs  = <number>,                -- override the 8000ms default
+--     file       = <string>,                -- pre-computed FORMATTED filename for logs (loggable)
+--     runId      = <string>,                -- run correlation id for logs
+--   }
+function M.fetch(photo, maxEdge, opts)
+    opts = opts or {}                                  -- MUST-FIX 2
+    local file      = type(opts.file) == 'string' and opts.file or '(unknown file)'
+    local runId     = opts.runId
+
+    local verdict, st = awaitThumbnail(photo, maxEdge, opts)
 
     if verdict == 'ready' then
         -- MUST-FIX 3: actual decoded dims from the bytes, never the requested maxEdge.
@@ -136,6 +154,54 @@ function M.fetch(photo, maxEdge, opts)
     -- warn (formatted filename only, never path/gps/date) and return nil + reason. The
     -- caller skips this photo; it NEVER aborts the run.
     log.warn("preview fetch did not produce bytes (skipping photo; run continues)", {
+        runId = runId, file = file, reason = verdict, error = tostring(st.err or verdict),
+    })
+    return nil, verdict
+end
+
+-- fetchThumbBytes(photo, edge, opts) -> jpegBytes | (nil, reason)   [Phase 9 — BL-07 clustering]
+--
+-- A SMALL-thumbnail fetch for the cluster similarity pre-pass. Unlike fetch() (which returns a
+-- transport table with parsed dims for the provider call), this returns the RAW JPEG BYTES only —
+-- they feed the PURE src.cluster.jpeg_thumb.dcLumaGrid decoder, which reduces the image to a fixed
+-- 8x8 luma grid for the aHash. We do NOT parse dims here (the pure decoder reads what it needs).
+--
+-- `edge` is the requested minimum edge in pixels; per BL-07 the caller passes >=128 (the decoder
+-- needs enough blocks to reduce to 8x8). We clamp a too-small / non-number edge UP to 128 so a bad
+-- caller can never request a degenerate thumbnail. The requested size is a MINIMUM (the SDK may
+-- return larger — fine, the decoder box-averages down to 8x8 regardless).
+--
+-- Reuses the IDENTICAL cooperative wait-loop + cancel handling as fetch() (awaitThumbnail), so it
+-- is yield-safe (runs inside an LrTasks task), holds the request ref across the loop, and honors
+-- the guarded isCanceled hook. On any non-ready verdict it returns (nil, reason) so the caller
+-- treats the photo as un-clusterable (a nil grid -> similarity.similar returns false -> the photo
+-- is identified independently — the SAFE no-merge direction). Logs token-free with the formatted
+-- filename only (NEVER the path/gps/date). opts: { isCanceled, timeoutMs, file, runId } as fetch().
+local MIN_THUMB_EDGE = 128
+
+function M.fetchThumbBytes(photo, edge, opts)
+    opts = opts or {}                                  -- MUST-FIX 2
+    local file  = type(opts.file) == 'string' and opts.file or '(unknown file)'
+    local runId = opts.runId
+
+    -- Clamp the requested edge UP to the >=128 minimum (BL-07); a non-number falls back to 128.
+    local e = tonumber(edge)
+    if type(e) ~= 'number' or e ~= e or e < MIN_THUMB_EDGE then e = MIN_THUMB_EDGE end
+
+    local verdict, st = awaitThumbnail(photo, e, opts)
+
+    if verdict == 'ready' then
+        -- Return the raw bytes only; the PURE jpeg_thumb decoder consumes them. A 'ready' verdict
+        -- guarantees st.jpeg is a non-empty string (the pure machine sets it on a successful
+        -- callback), but guard defensively so a malformed machine state never returns a bad value.
+        if type(st.jpeg) == 'string' and st.jpeg ~= '' then
+            return st.jpeg
+        end
+        return nil, 'bad-thumb-bytes'
+    end
+
+    -- Non-ready: clustering for this photo is skipped (it identifies independently). Token-free.
+    log.info("thumbnail fetch did not produce bytes (clustering skipped for this photo)", {
         runId = runId, file = file, reason = verdict, error = tostring(st.err or verdict),
     })
     return nil, verdict
