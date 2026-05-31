@@ -132,6 +132,11 @@ ADR if a phase needs to change one.
   - unsure species → trailing `?` e.g. `Common (Scientific)?`
   - only genus/family known → render that rank with `?` e.g. `Cardinalis sp.?` or
     family-level fallback.
+  - **STORED-NAME AMENDMENT (ADR-001, 2026-05-30):** Lightroom's `createKeyword` REJECTS `?`
+    (returns nil), so the `?` marker is the *display/report* form only. The **catalog keyword
+    actually written** substitutes a writable ` (uncertain)` suffix, e.g.
+    `Cardinalis sp. (uncertain)`. Mapping lives in pure `src/keyword_name.lua`, applied in
+    `writeplan` (so plan/diff/idempotency all use the stored form). See `.planning/adr/ADR-001`.
   - A user-defined prompt addition (from settings) is appended to the ID prompt and
     influences rendering.
 - **Selection scope:** operate on `catalog:getTargetPhotos()` (the selection, else the

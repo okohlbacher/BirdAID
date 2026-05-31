@@ -366,3 +366,35 @@ do
     local reportWet = W.planReport(results, prefsWet)
     assert_eq(reportWet.dryRun, false, "planReport: dryRun false when prefs.dryRun=false")
 end
+
+-- =====================================================================
+-- 13. BL-15: the plan emits LIGHTROOM-WRITABLE names for uncertain detections.
+--     createKeyword rejects '?', so writeplan maps the rendered '?' marker to
+--     ' (uncertain)' in the plan/diff/idempotency path (not only at the write call).
+-- =====================================================================
+do
+    -- Uncertain genus detection -> planned keyword is ' (uncertain)', never '?'.
+    local results = {
+        { photoKey = 'U', photo = 'hU',
+          response = resp(true, { genusDet('Cardinalis', 0.9) }),
+          existingNames = {} },
+    }
+    local out = W.build(results, PREFS)
+    local e = entryFor(out.plan, 'U')
+    assert_true(e ~= nil, "BL-15: uncertain genus produces an entry")
+    assert_eq(e.addKeywords[1], 'Cardinalis sp. (uncertain)', "BL-15: genus name is writable")
+    assert_true(e.addKeywords[1]:find('%?') == nil, "BL-15: no '?' in the planned keyword")
+    assert_eq(out.summary.perPhoto['U'].uncertain, 1, "BL-15: counted uncertain")
+    assert_eq(out.summary.perPhoto['U'].identified, 0, "BL-15: not counted identified")
+end
+
+do
+    -- Idempotency: existingNames already holds the WRITABLE form -> NO new add (re-run safe).
+    local results = {
+        { photoKey = 'U', photo = 'hU',
+          response = resp(true, { genusDet('Cardinalis', 0.9) }),
+          existingNames = { ['Cardinalis sp. (uncertain)'] = true } },
+    }
+    local out = W.build(results, PREFS)
+    assert_eq(entryFor(out.plan, 'U'), nil, "BL-15: writable name already present -> no entry")
+end

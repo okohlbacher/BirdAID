@@ -49,9 +49,10 @@
 --
 -- Strictly Lua 5.1 common subset: no \u{}, no //, no goto, no <close>; unpack is global.
 -- This module imports no SDK and is kept clean of the SDK-import token so the negative-purity
--- grep prints only the known-pure require of the keyword core (NIT 21).
+-- grep prints only the known-pure requires of the keyword core + keyword_name (NIT 21).
 
 local keyword = require('src.keyword')
+local keyword_name = require('src.keyword_name')
 
 local M = {}
 
@@ -99,8 +100,13 @@ function M.build(results, prefs)
                 for _, det in ipairs(dets) do
                     local dec = keyword.decide(det, prefs)
                     if dec.action == 'write' then
+                        -- render() emits the canonical display form (may carry a trailing '?').
+                        -- Map it to a Lightroom-WRITABLE name HERE so the dedupe, the add-only
+                        -- diff against existing catalog names, the dry-run plan, and the counts
+                        -- all use the SAME stored form (BL-15: createKeyword rejects '?').
                         local name = keyword.render(dec)
                         if name ~= nil then
+                            name = keyword_name.toWritable(name)
                             renderedRecs[#renderedRecs + 1] = {
                                 name = name,
                                 rank = dec.rank,
