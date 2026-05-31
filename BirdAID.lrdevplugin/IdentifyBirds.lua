@@ -294,6 +294,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local wasCancelled = false
     local deferred     = 0    -- photos skipped after the breaker opened / deferred clusters.
     local cancelledCnt = 0    -- photos cancelled (feature branch reports this; serial folds into break).
+    local reportNote   = nil  -- set when the detection report was suppressed (too many to open).
 
     -- The REAL dispatch decision lives in orchestrate.dispatch (spec-driven): at defaults it runs
     -- runSerial and NEVER runFeatures, so the feature modules' LAZY requires (inside runFeatures)
@@ -512,35 +513,57 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- the gate. The orphan-sweep already ran UNCONDITIONALLY at step 0 -- do NOT re-sweep here.
         -- Guarded per photo; never blocks the run; cancel-aware.
         if prefs.showDetectionReport == true and prefs.dryRun ~= true then
-            local repIdx = 0
+            -- The report opens ONE browser tab per detected photo. Count eligible photos FIRST and
+            -- SUPPRESS the entire report above a small cap, so a bulk run never floods the browser
+            -- with dozens/hundreds of tabs (BL-13: a single combined gallery is the proper fix).
+            local REPORT_OPEN_LIMIT = 20
+            local eligible = 0
             for ei = 1, #fr.results do
-                if cancelled(progress) then break end
-                local entry = fr.results[ei]
-                local resp = entry.response
-                if type(resp) == 'table' and type(resp.detections) == 'table'
-                    and #resp.detections > 0 then
-                    repIdx = repIdx + 1
-                    local photo = entry.photo
-                    local file = photoName(photo)
-                    -- Re-fetch the small preview bytes + dims for the report (OUTSIDE the gate).
-                    -- YIELD-SAFE: previewFetch.fetch yields (LrTasks.sleep) and vizReport.writeAndOpen
-                    -- may LrTasks.execute (open) — both yield across a C frame, so this MUST be the
-                    -- yield-safe LrTasks.pcall, NEVER a standard C pcall (Lua 5.1 forbids yielding
-                    -- across a standard pcall boundary).
-                    LrTasks.pcall(function()
-                        local transport = previewFetch.fetch(photo, maxEdge, {
-                            isCanceled = function() return cancelled(progress) end,
-                            file = file, runId = runId,
-                        })
-                        local bytes, fw, fh
-                        if type(transport) == 'table' then
-                            bytes = transport.data; fw = transport.width; fh = transport.height
-                        end
-                        vizReport.writeAndOpen({
-                            runId = runId, idx = repIdx, previewBytes = bytes,
-                            frameW = fw, frameH = fh, response = resp, prefs = prefs, file = file,
-                        })
-                    end)
+                local r = fr.results[ei]
+                if type(r.response) == 'table' and type(r.response.detections) == 'table'
+                    and #r.response.detections > 0 then
+                    eligible = eligible + 1
+                end
+            end
+            if eligible > REPORT_OPEN_LIMIT then
+                reportNote = string.format(
+                    "Detection report not opened: %d photos have detections (limit %d). "
+                    .. "Re-run on a smaller selection to view the report.",
+                    eligible, REPORT_OPEN_LIMIT)
+                log.warn("detection report suppressed (too many to open)", {
+                    runId = runId, eligible = eligible, limit = REPORT_OPEN_LIMIT,
+                })
+            else
+                local repIdx = 0
+                for ei = 1, #fr.results do
+                    if cancelled(progress) then break end
+                    local entry = fr.results[ei]
+                    local resp = entry.response
+                    if type(resp) == 'table' and type(resp.detections) == 'table'
+                        and #resp.detections > 0 then
+                        repIdx = repIdx + 1
+                        local photo = entry.photo
+                        local file = photoName(photo)
+                        -- Re-fetch the small preview bytes + dims for the report (OUTSIDE the gate).
+                        -- YIELD-SAFE: previewFetch.fetch yields (LrTasks.sleep) and vizReport.writeAndOpen
+                        -- may LrTasks.execute (open) — both yield across a C frame, so this MUST be the
+                        -- yield-safe LrTasks.pcall, NEVER a standard C pcall (Lua 5.1 forbids yielding
+                        -- across a standard pcall boundary).
+                        LrTasks.pcall(function()
+                            local transport = previewFetch.fetch(photo, maxEdge, {
+                                isCanceled = function() return cancelled(progress) end,
+                                file = file, runId = runId,
+                            })
+                            local bytes, fw, fh
+                            if type(transport) == 'table' then
+                                bytes = transport.data; fw = transport.width; fh = transport.height
+                            end
+                            vizReport.writeAndOpen({
+                                runId = runId, idx = repIdx, previewBytes = bytes,
+                                frameW = fw, frameH = fh, response = resp, prefs = prefs, file = file,
+                            })
+                        end)
+                    end
                 end
             end
         end
@@ -608,6 +631,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         .. "  |  deferred: " .. tostring(deferred)
         .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
         .. (wasCancelled and "  (cancelled)" or "")
+        .. (reportNote and ("\n\n" .. reportNote) or "")
         .. "\n\nDetails are in the BirdAID log:\n" .. logPath
 
     local kind = (perRun.errors > 0 or writeResult == 'error' or bstate.open) and "warning" or "info"
