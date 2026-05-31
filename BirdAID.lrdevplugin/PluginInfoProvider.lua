@@ -84,6 +84,17 @@ local function computeTokenStatus(tokenKey)
     return settings.tokenStatus(ok, val)
 end
 
+-- Human display name for a provider value (catalog title minus the " (default)" suffix), so the
+-- token field can name WHICH provider's key is being set. Falls back to the raw value.
+local function providerDisplay(provider)
+    for _, it in ipairs(settings.providerItems()) do
+        if it.value == provider then
+            return (it.title:gsub("%s*%(default%)%s*$", ""))
+        end
+    end
+    return tostring(provider or "")
+end
+
 -- Refresh the transient token UI state on propertyTable for the CURRENT provider:
 -- recompute the active key, status, label, and whether Save is enabled (a nil key disables
 -- Save). NEVER reads or stores the secret value.
@@ -93,6 +104,8 @@ local function refreshTokenState(propertyTable, prefs)
     propertyTable.tokenStatus   = status
     propertyTable.tokenLabel    = labelForStatus(status)
     propertyTable.saveEnabled   = (tokenKey ~= nil)
+    -- Make the field name WHICH provider's key it sets, so it is obvious the key is per-provider.
+    propertyTable.tokenFieldTitle = "API token (" .. providerDisplay(prefs.provider) .. "):"
 end
 
 local function sectionsForTopOfDialog(f, propertyTable)
@@ -205,9 +218,13 @@ local function sectionsForTopOfDialog(f, propertyTable)
             },
 
             -- TOKEN: bound to the TRANSIENT propertyTable (NEVER prefs). The entry is
-            -- write-only; the secret is never read back into a visible field.
+            -- write-only; the secret is never read back into a visible field. The label names the
+            -- CURRENT provider (reactive) so it is clear the key is stored PER provider.
             f:row {
-                f:static_text { title = "API token:", width = 140 },
+                f:static_text {
+                    title = bind { key = 'tokenFieldTitle', bind_to_object = propertyTable },
+                    width = 140,
+                },
                 f:password_field {
                     value = bind { key = 'apiTokenEntry', bind_to_object = propertyTable },
                     width_in_chars = 40,
@@ -218,6 +235,19 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 f:static_text {
                     title = bind { key = 'tokenLabel', bind_to_object = propertyTable },
                     width_in_chars = 60,
+                },
+            },
+
+            -- Make the per-provider key model discoverable (users expected one global key).
+            f:row {
+                f:static_text {
+                    title = "Each provider keeps its OWN key. To use more than one, switch "
+                        .. "\"Provider\" above, enter that provider's key, and Save again. Keys are "
+                        .. "stored separately in the OS keychain; this field clears on switch (the "
+                        .. "saved key is never shown) — the status line above tells you if the "
+                        .. "selected provider has a key.",
+                    width_in_chars = 60,
+                    height_in_lines = 4,
                 },
             },
 
