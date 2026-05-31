@@ -48,6 +48,23 @@ for _, s in ipairs(samples) do
     assert_true(KN.toWritable(s):find('%?') == nil, 'no ? remains in writable name: ' .. s)
 end
 
+-- ---- Commas (LrC keyword delimiter) are removed -------------------------------------------
+
+-- confident species with a multi-language common name joined by ", " (real failing case)
+assert_eq(KN.toWritable('Western Grebe, Westlicher Haubentaucher (Aechmophorus occidentalis)'),
+    'Western Grebe Westlicher Haubentaucher (Aechmophorus occidentalis)', 'comma removed + collapsed')
+assert_true(KN.toWritable('Western Grebe, Westlicher Haubentaucher (Aechmophorus occidentalis)')
+    :find(',', 1, true) == nil, 'no comma remains')
+-- comma AND a trailing uncertainty marker together
+assert_eq(KN.toWritable('A, B?'), 'A B (uncertain)', 'comma + marker both handled')
+-- a bare comma name collapses without leaving stray whitespace
+assert_eq(KN.toWritable('Foo,Bar'), 'Foo Bar', 'comma with no space still split cleanly')
+-- ordering edge (CODEX): comma AFTER the '?' must not re-expose a trailing '?'; comma cleaned first
+assert_eq(KN.toWritable('A?,'), 'A (uncertain)', 'comma-after-? handled: no stray ? remains')
+assert_true(KN.toWritable('A?,'):find('%?') == nil, 'no ? remains for the A?, edge')
+-- pathological comma-only input never yields a blank name
+assert_eq(KN.toWritable(','), ',', 'comma-only pathological input falls back to original (never blank)')
+
 -- ---- Idempotency: re-mapping an already-writable name is stable ------------------------------
 
 local once = KN.toWritable('Cardinalis sp.?')

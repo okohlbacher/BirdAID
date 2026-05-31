@@ -201,6 +201,16 @@ function M.apply(catalog, plan, actionName, fields, opts)
     local errorCount = 0
     local firstError = nil
     local firstErrSubject = nil
+    -- DIAGNOSTIC (BL-15 follow-up): capture the actual REJECTED keyword names so we can see exactly
+    -- which character/pattern createKeyword refuses. Keyword names are bird names, NOT secrets, but
+    -- they are %q-quoted so any invisible/odd byte (control char, stray quote) is visible in the log.
+    -- Capped to keep the line bounded; redaction sink still applies as a backstop.
+    local failedNames = {}
+    local function noteFailed(name)
+        if #failedNames < 15 then
+            failedNames[#failedNames + 1] = string.format('%q', tostring(name))
+        end
+    end
 
     -- DI-HARDENING: prove the protected closure actually RAN before trusting a success verdict.
     -- A pathological injected opts.pcall could return `true, <verdict>` WITHOUT ever invoking its
@@ -217,6 +227,14 @@ function M.apply(catalog, plan, actionName, fields, opts)
         gateRan = true
         return catalog:withWriteAccessDo(actionName, function()
             local entryIdx = 0
+            -- DUPLICATE-IN-GATE CACHE: a clustered burst applies the SAME new keyword name to many
+            -- photos, so createKeyword runs N times for one name in a SINGLE gate. LrC's
+            -- createKeyword(returnExisting=true) returns nil on the 2nd+ call for a name created
+            -- earlier in the SAME uncommitted transaction (the catalog index isn't live mid-gate).
+            -- Cache the keyword OBJECT by name and reuse it; addKeyword still runs per photo, so
+            -- createKeyword executes exactly once per UNIQUE name. (Bug found live: clustered
+            -- genus/family keywords failed on every repeat.)
+            local kwByName = {}
             for _, entry in ipairs(entries) do
                 local names = (type(entry) == 'table' and type(entry.addKeywords) == 'table') and entry.addKeywords or {}
                 local photo = entry.photo
@@ -241,11 +259,20 @@ function M.apply(catalog, plan, actionName, fields, opts)
                     -- guard is dead and behavior is byte-for-byte unchanged. COLON syntax inside the
                     -- closure keeps `self` correct; createKeyword args (name,nil,true,nil,true) and the
                     -- returnExisting=true semantics are preserved.
-                    local ranKw = false
-                    local okKw, kw = protect(function() ranKw = true; return catalog:createKeyword(name, nil, true, nil, true) end)
-                    if okKw and not ranKw then
-                        okKw = false
-                        kw = 'write gate protector skipped createKeyword'
+                    local okKw, kw
+                    local cachedKw = kwByName[name]
+                    if cachedKw ~= nil then
+                        -- Same name already created earlier in THIS gate: reuse the object (avoids the
+                        -- mid-transaction createKeyword-returns-nil gotcha for duplicates).
+                        okKw, kw = true, cachedKw
+                    else
+                        local ranKw = false
+                        okKw, kw = protect(function() ranKw = true; return catalog:createKeyword(name, nil, true, nil, true) end)
+                        if okKw and not ranKw then
+                            okKw = false
+                            kw = 'write gate protector skipped createKeyword'
+                        end
+                        if okKw and kw then kwByName[name] = kw end
                     end
                     if okKw and kw then
                         local ranAdd = false
@@ -258,6 +285,7 @@ function M.apply(catalog, plan, actionName, fields, opts)
                             addedCount = addedCount + 1
                         else
                             errorCount = errorCount + 1
+                            noteFailed(name)
                             if firstError == nil then
                                 firstError = tostring(addErr)
                                 firstErrSubject = subjects[entryIdx]
@@ -265,6 +293,7 @@ function M.apply(catalog, plan, actionName, fields, opts)
                         end
                     else
                         errorCount = errorCount + 1
+                        noteFailed(name)
                         if firstError == nil then
                             -- okKw==false => kw holds the error; okKw==true but kw nil/false
                             -- => createKeyword returned no keyword.
@@ -319,6 +348,10 @@ function M.apply(catalog, plan, actionName, fields, opts)
         baseFields.writeResult = 'error'
         baseFields.rawResult = tostring(result)
         baseFields.error = tostring(firstError)
+        -- DIAGNOSTIC (BL-15 follow-up): the %q-quoted names (capped) that FAILED to write -- either
+        -- createKeyword refused them OR addKeyword raised -- so we can see exactly which name/pattern
+        -- is involved.
+        baseFields.failedNames = table.concat(failedNames, ' | ')
         local s = firstErrSubject or subjects[1]
         if s then
             baseFields.photoKey = s.photoKey

@@ -295,6 +295,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local deferred     = 0    -- photos skipped after the breaker opened / deferred clusters.
     local cancelledCnt = 0    -- photos cancelled (feature branch reports this; serial folds into break).
     local reportNote   = nil  -- set when the detection report was suppressed (too many to open).
+    local peakConcurrency = nil  -- max in-flight AI calls observed (parallel path); nil on serial.
 
     -- The REAL dispatch decision lives in orchestrate.dispatch (spec-driven): at defaults it runs
     -- runSerial and NEVER runFeatures, so the feature modules' LAZY requires (inside runFeatures)
@@ -427,7 +428,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- previews SERIALLY on this (main) task and parallelizes only the gated provider call,
         -- bounded to maxConcurrency in flight. This fixes the concurrent-preview-timeout bug.
         local function poolRun(anchors)
-            return stagedPool.run({
+            local r = stagedPool.run({
                 items          = anchors,
                 maxConcurrency = prefs.maxConcurrency,
                 fetchJob       = producerFetch,
@@ -440,6 +441,13 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
                 progress       = progress,
                 runId          = runId,
             })
+            -- DIAGNOSTIC (parallelism): record the highest observed in-flight count across poolRun
+            -- call(s) so the run summary can show whether we actually ran N-wide or were starved by
+            -- the SERIAL preview fetch / cluster pre-pass (peak << maxConcurrency => starved).
+            if type(r) == 'table' and type(r.peakConcurrency) == 'number' then
+                peakConcurrency = math.max(peakConcurrency or 0, r.peakConcurrency)
+            end
+            return r
         end
 
         -- fetchGrid(photo,i): >=128px thumb bytes -> PURE DC-luma grid (nil => not similar => no
@@ -613,6 +621,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         found = perRun.found, identified = perRun.identified, uncertain = perRun.uncertain,
         errors = perRun.errors, skipped = perRun.skipped,
         featuresOff = featuresOff, maxConcurrency = prefs.maxConcurrency,
+        peakConcurrency = peakConcurrency,
         clusterBursts = prefs.clusterBursts, showDetectionReport = prefs.showDetectionReport,
         dryRun = report.dryRun, writeResult = writeResult, logFile = logPath,
     })

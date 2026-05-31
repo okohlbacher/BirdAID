@@ -84,6 +84,8 @@ do
     assert_eq(captions[#captions], "Processed 3 of 3", "BL-12: final caption is X-of-Y at total")
     assert_eq(portions[#portions][1], 3, "BL-12: final portionComplete done == total")
     assert_eq(portions[#portions][2], 3, "BL-12: final portionComplete total == 3")
+    -- peakConcurrency is observed and bounded by maxConcurrency (2 here).
+    assert_eq(out.peakConcurrency, 2, "peakConcurrency: reaches and is bounded by maxConcurrency")
 end
 
 -- (2) a preview-fetch failure (fetchJob nil) -> 'error'; identifyJob NEVER called for it.

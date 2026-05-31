@@ -72,6 +72,7 @@ function M.run(opts)
     local responseByAnchorKey = {}
     local total = #items
     local inFlight = 0
+    local peakInFlight = 0   -- max simultaneous in-flight AI consumers (observed concurrency)
     local done = 0
 
     local function breakerOpen()
@@ -128,6 +129,7 @@ function M.run(opts)
         else
             -- CONSUMER: gated provider call ONLY, in its own cooperative task (parallel up to maxC).
             inFlight = inFlight + 1
+            if inFlight > peakInFlight then peakInFlight = inFlight end   -- observed concurrency
             spawn(function()
                 local st = 'fatal'
                 local resp = nil
@@ -152,7 +154,11 @@ function M.run(opts)
         sleep(0.05)
     end
 
-    return { statusByAnchorKey = statusByAnchorKey, responseByAnchorKey = responseByAnchorKey }
+    return {
+        statusByAnchorKey = statusByAnchorKey,
+        responseByAnchorKey = responseByAnchorKey,
+        peakConcurrency = peakInFlight,   -- max in-flight observed; compare to maxConcurrency
+    }
 end
 
 return M

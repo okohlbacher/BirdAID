@@ -14,12 +14,17 @@
 --   wrote fine. The locked '?' marker is therefore AMENDED for the STORED catalog name to a
 --   writable ' (uncertain)' suffix (see the ADR). The rendered display/report form keeps '?'.
 --
--- RULE (toWritable):
---   * If the name ends with '?' (one or more, defensively), drop that trailing run of '?' plus
---     any surrounding trailing whitespace, then append ' (uncertain)'.
---   * Names WITHOUT a trailing '?' are returned UNCHANGED (confident keywords are untouched).
---   * Idempotent: a name already ending in ' (uncertain)' has no trailing '?', so it is left
---     as-is -> re-running the plan against already-stored names produces zero new adds.
+-- RULE (toWritable): produce a name that LrCatalog:createKeyword will accept.
+--   (1) Trailing '?' uncertainty marker -> ' (uncertain)'. If the name ends with '?' (one or more,
+--       defensively), drop that trailing run of '?' plus surrounding trailing whitespace, then
+--       append ' (uncertain)'. Names without a trailing '?' keep their stem unchanged.
+--   (2) COMMAS removed. LrC uses comma as the keyword delimiter, so createKeyword REJECTS any name
+--       containing ',' (returns nil). The AI sometimes returns a multi-language common name
+--       ("Western Grebe, Westlicher Haubentaucher"); replace each comma with a space and collapse
+--       the run so the name stays writable. (A nicer English-only fix is a prompt/render concern;
+--       this is the safety net at the write boundary — see BACKLOG.)
+--   * Idempotent: a name already ending ' (uncertain)' has no trailing '?', and a comma-free name is
+--     left as-is -> re-running the plan against already-stored names produces zero new adds.
 --   * Defensive: a non-string is passed through unchanged; a name that is ONLY a marker
 --     (empty stem) is returned unchanged rather than producing a bare ' (uncertain)'.
 --
@@ -35,14 +40,25 @@ M.MARKER = ' (uncertain)'
 -- toWritable(name) -> writable string | name unchanged | non-string passthrough
 function M.toWritable(name)
     if type(name) ~= 'string' then return name end
-    -- Strip a trailing run of '?' (defensive against any '??') plus surrounding whitespace.
-    local stem, n = name:gsub('%s*%?+%s*$', '')
-    if n == 0 then
-        return name                       -- no trailing '?': confident/clean name, unchanged
+    local out = name
+    -- (1) commas are illegal in LrC keyword names -> replace with space, collapse, trim. Done FIRST
+    --     so a comma sitting before the marker (e.g. "A?,") cannot RE-EXPOSE a trailing '?' after
+    --     the marker step (CODEX review).
+    if out:find(',', 1, true) then
+        out = (out:gsub(',', ' '))
+        out = (out:gsub('%s+', ' '))
+        out = (out:gsub('^%s+', ''):gsub('%s+$', ''))
     end
-    stem = (stem:gsub('%s+$', ''))        -- trim any residual trailing whitespace on the stem
-    if stem == '' then return name end    -- pathological: never emit a bare marker
-    return stem .. M.MARKER
+    -- (2) trailing '?' marker -> ' (uncertain)' (after comma cleanup so the tail is final).
+    local stem, n = out:gsub('%s*%?+%s*$', '')
+    if n > 0 then
+        stem = (stem:gsub('%s+$', ''))        -- trim residual trailing whitespace on the stem
+        if stem ~= '' then out = stem .. M.MARKER end   -- else pathological: keep pre-marker `out`
+    end
+    -- (3) never emit a blank name (pathological comma-only / marker-only input): fall back to the
+    --     original input unchanged rather than "" (the writer will simply skip a truly-blank name).
+    if out == '' then return name end
+    return out
 end
 
 return M

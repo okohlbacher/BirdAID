@@ -361,5 +361,37 @@ do
     assert_eq(#logged.info, 0, "innerSkip: NO success info log")
 end
 
+-- =====================================================================
+-- BL-15 follow-up: DUPLICATE keyword name across photos in ONE gate. Stub catalog mimics LrC
+-- returning the keyword on the FIRST createKeyword for a name and nil on the 2nd+ for the SAME
+-- name (the mid-transaction gotcha that broke clustered genus/family keywords). The writer's
+-- per-gate cache must reuse the object so BOTH photos get the keyword, createKeyword runs once,
+-- and there are NO per-keyword failures.
+-- =====================================================================
+do
+    resetLog()
+    local createCounts = {}
+    local cat = {
+        createKeyword = function(self, name)
+            createCounts[name] = (createCounts[name] or 0) + 1
+            if createCounts[name] == 1 then return { name = name } end
+            return nil   -- 2nd+ call for the same NEW name in one uncommitted gate -> nil
+        end,
+        withWriteAccessDo = function(self, action, body) body(); return "executed" end,
+    }
+    local pA, pB = stubPhoto(), stubPhoto()
+    local NAME = "Cardinalis sp. (uncertain)"
+    local plan = { entries = {
+        { photoKey = "pA", photo = pA, addKeywords = { NAME } },
+        { photoKey = "pB", photo = pB, addKeywords = { NAME } },
+    } }
+    local r = W.apply(cat, plan, "BirdAID: write", { runId = "t" })
+    assert_eq(r, 'executed', "dup-in-gate: status executed (cache reuses the keyword object)")
+    assert_eq(createCounts[NAME], 1, "dup-in-gate: createKeyword called ONCE for the shared name")
+    assert_eq(pA.applied[1], NAME, "dup-in-gate: photo A got the keyword")
+    assert_eq(pB.applied[1], NAME, "dup-in-gate: photo B ALSO got the keyword (cache hit, no nil)")
+    assert_eq(#logged.error, 0, "dup-in-gate: no per-keyword failure logged")
+end
+
 -- Clean up the injected fake so it cannot leak into another spec's require graph.
 package.loaded['src.log'] = nil
