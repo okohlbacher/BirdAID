@@ -60,7 +60,7 @@ local log     = require 'src.log'
 local M = {}
 
 -- Default poll interval (seconds) and default timeout (ms). The timeout default mirrors
--- src.preview.newState's 8000ms; callers may override via opts.timeoutMs.
+-- src.preview.newState's 30000ms default; callers may override via opts.timeoutMs.
 local POLL_SECONDS  = 0.05
 local DEFAULT_TIMEOUT_MS = 30000   -- cold-catalog renders can exceed a few seconds; see preview.lua
 
@@ -141,7 +141,7 @@ end
 -- fetch(photo, maxEdge, opts) -> { kind='bytes', data, width, height } | (nil, reason)
 --   opts (optional) = {
 --     isCanceled = function() -> boolean,   -- e.g. function() return progress:isCanceled() end
---     timeoutMs  = <number>,                -- override the 8000ms default
+--     timeoutMs  = <number>,                -- override the 30000ms default
 --     file       = <string>,                -- pre-computed FORMATTED filename for logs (loggable)
 --     runId      = <string>,                -- run correlation id for logs
 --   }
