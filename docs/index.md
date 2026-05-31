@@ -94,7 +94,7 @@ choosing.
 
 ## Status
 
-v1.0. No external tools — runs on macOS and Windows (macOS is the primary tested platform).
+v1.1. No external tools — runs on macOS and Windows (macOS is the primary tested platform).
 
 The core end-to-end pipeline (preview fetch → vision ID → flat keyword write-back) is
 verified end-to-end with **OpenAI** (including idempotent re-runs that never clobber your

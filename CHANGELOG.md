@@ -4,6 +4,43 @@ All notable changes to BirdAID are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/), and the project aims to follow
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] — 2026-05-30
+
+Cross-platform + keyword-write correctness. Builds on 1.0; no migration needed (a re-run
+adds any keywords that previously failed).
+
+### Fixed
+- **Uncertain / genus / family keywords now write to the catalog.** Lightroom's `createKeyword`
+  silently rejected several keyword strings, so the *normal* graceful-degradation case failed to
+  keyword at all. Three distinct rejections were found (via a new failed-name diagnostic) and fixed:
+  - **`?`** is rejected → the uncertainty marker is now stored as ` (uncertain)` (e.g.
+    `Cardinalis sp. (uncertain)`); the `?` form remains the display/report form (ADR-001).
+  - **`,`** is rejected (it's Lightroom's keyword delimiter) → commas in AI-returned names
+    (e.g. multi-language common names) are sanitized out of the stored keyword.
+  - **Duplicate name within one write gate** → `createKeyword` returns nil on the 2nd+ call for a
+    name created earlier in the same transaction (hit by clustered bursts). The writer now caches
+    the keyword object per gate, so each unique name is created once and applied to every photo.
+
+### Changed
+- **Removed the experimental crop-for-ID pass** (and its ImageMagick dependency). Identification is
+  now fully cloud-native on the downsampled preview, so BirdAID runs on **macOS and Windows**
+  (Windows not yet formally verified). The crop/rate-limit/image-tool settings were retired.
+- **Simplified the throughput controls** to a single, plain **Number of parallel requests** (1–50).
+
+### Added
+- **"Processed X of Y" progress caption** on the parallel path (the bar now shows a running count).
+- **Detection-report flood guard:** the report is suppressed (with a summary note) when more than
+  20 photos have detections, instead of opening a browser tab per photo.
+- **Per-provider API keys are now discoverable** in settings: the key field names the active
+  provider (e.g. "API token (Claude):") with a one-line explanation that each provider keeps its
+  own key. (The separate per-provider Keychain slots already existed.)
+- **`peakConcurrency` diagnostic** in the run summary — the max simultaneous in-flight AI calls,
+  so actual parallelism is observable.
+
+### Notes
+- Privacy unchanged: a **downsampled JPEG preview** (never the full-resolution original) is uploaded
+  for identification; the API token stays in the OS keychain; GPS/date are opt-in and redacted.
+
 ## [1.0.0] — 2026-05-30
 
 First stable release. macOS only.

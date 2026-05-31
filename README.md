@@ -11,7 +11,7 @@ photos, detects whether each contains a bird, identifies the species using a
 configurable vision-AI backend, and writes the result back into your catalog as
 keywords — without ever touching your existing data.
 
-> **v1.0.** OpenAI is the fully verified provider; Claude and Gemini are implemented behind the
+> **v1.1.** OpenAI is the fully verified provider; Claude and Gemini are implemented behind the
 > same interface. No external tools — runs on macOS and Windows (macOS is the primary tested platform).
 >
 > **⚠️ Privacy:** to identify a photo, BirdAID uploads a **downsampled JPEG preview** of it (never
