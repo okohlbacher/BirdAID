@@ -62,6 +62,30 @@ do
     assert_true(keysResolved(out, { 'a', 'b', 'c' }), "staged: every item resolved exactly once")
 end
 
+-- (1b) BL-12: progress reports BOTH portionComplete AND an "X of Y" caption, reaching the
+--      final total once every anchor resolves.
+do
+    local s = newSched()
+    local portions, captions = {}, {}
+    local fakeProgress = {
+        setPortionComplete = function(_, done, tot) portions[#portions + 1] = { done, tot } end,
+        setCaption = function(_, text) captions[#captions + 1] = text end,
+    }
+    local out = staged.run({
+        items = { 'a', 'b', 'c' },
+        maxConcurrency = 2,
+        fetchJob = function(k) return { key = k } end,
+        identifyJob = function() return 'identified', {} end,
+        spawn = s.spawn, sleep = s.sleep, yield = s.yield,
+        progress = fakeProgress,
+    })
+    assert_true(keysResolved(out, { 'a', 'b', 'c' }), "BL-12: all resolved")
+    assert_true(#captions > 0, "BL-12: a caption was set")
+    assert_eq(captions[#captions], "Processed 3 of 3", "BL-12: final caption is X-of-Y at total")
+    assert_eq(portions[#portions][1], 3, "BL-12: final portionComplete done == total")
+    assert_eq(portions[#portions][2], 3, "BL-12: final portionComplete total == 3")
+end
+
 -- (2) a preview-fetch failure (fetchJob nil) -> 'error'; identifyJob NEVER called for it.
 do
     local s = newSched()

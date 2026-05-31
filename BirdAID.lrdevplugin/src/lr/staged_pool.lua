@@ -80,9 +80,15 @@ function M.run(opts)
     end
 
     local function bumpProgress()
-        if type(progress) == 'table' and type(progress.setPortionComplete) == 'function' then
-            -- non-yielding UI update; guard so a bad scope can never break accounting.
+        if type(progress) ~= 'table' then return end
+        -- non-yielding UI updates; guard each so a bad scope can never break accounting.
+        if type(progress.setPortionComplete) == 'function' then
             protect(function() progress:setPortionComplete(done, total) end)
+        end
+        -- BL-12: X-of-Y caption. The parallel path completes out of order, so a running
+        -- "Processed N of M" count is the meaningful signal (the bar alone has no number).
+        if type(progress.setCaption) == 'function' then
+            protect(function() progress:setCaption(string.format("Processed %d of %d", done, total)) end)
         end
     end
 
