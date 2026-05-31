@@ -449,6 +449,10 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             local okFetch, bytes = LrTasks.pcall(function()
                 return previewFetch.fetchThumbBytes(photo, 128, {
                     isCanceled = function() return cancelled(progress) end,
+                    -- clustering is BEST-EFFORT: a thumbnail miss just skips clustering for this
+                    -- photo (it becomes its own anchor), so use a SHORT timeout and don't block the
+                    -- whole pre-pass waiting on a cold render.
+                    timeoutMs = 8000,
                     file = file, runId = runId,
                 })
             end)

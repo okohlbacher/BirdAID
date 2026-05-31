@@ -62,7 +62,7 @@ local M = {}
 -- Default poll interval (seconds) and default timeout (ms). The timeout default mirrors
 -- src.preview.newState's 8000ms; callers may override via opts.timeoutMs.
 local POLL_SECONDS  = 0.05
-local DEFAULT_TIMEOUT_MS = 8000
+local DEFAULT_TIMEOUT_MS = 30000   -- cold-catalog renders can exceed a few seconds; see preview.lua
 
 -- wallClockSeconds() -> a monotonically-advancing real-time seconds value (NOT CPU time).
 -- LrDate.currentTime() when available (real wall clock during LrTasks.sleep), else os.time

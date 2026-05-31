@@ -116,9 +116,11 @@ end
 -- (callback fired? cancelled? elapsed time); decide() reads the state.
 -- ---------------------------------------------------------------------------
 
--- newState(timeoutMs) -> a plain table the glue mutates; default timeout 8000ms.
+-- newState(timeoutMs) -> a plain table the glue mutates; default timeout 30000ms. (Cold-catalog
+-- preview RENDERS can take many seconds; an 8s default silently skipped photos. 30s lets a cold
+-- render complete; building previews in Lightroom first is still far faster.)
 function M.newState(timeoutMs)
-    return { status = 'pending', timeoutMs = timeoutMs or 8000 }
+    return { status = 'pending', timeoutMs = timeoutMs or 30000 }
 end
 
 -- onCallback(state, jpeg, err): record the FIRST callback only. The Lr callback may fire

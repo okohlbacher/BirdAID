@@ -193,7 +193,7 @@ end
 do
     local st = P.newState()
     assert_eq(st.status, 'pending', "newState default status pending")
-    assert_eq(st.timeoutMs, 8000, "newState default timeout 8000")
+    assert_eq(st.timeoutMs, 30000, "newState default timeout 30000 (cold-render tolerant)")
     assert_eq(P.newState(1234).timeoutMs, 1234, "newState honors timeoutMs arg")
 end
 
