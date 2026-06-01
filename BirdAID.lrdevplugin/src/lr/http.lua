@@ -38,6 +38,7 @@ local LrPasswords   = import 'LrPasswords'
 local LrTasks       = import 'LrTasks'
 
 local settings = require 'src.settings'
+local keystore = require 'src.lr.keystore'         -- slot-aware Keychain glue (the failover seam)
 local log      = require 'src.log'                 -- single redacting sink (for transport diagnostics)
 local redact   = require('src.redact').redact      -- backstop redaction of any raised message
 
@@ -243,9 +244,14 @@ end
 -- provider is KEPT, and a non-empty CUSTOM string (not in ANY provider's catalog) is KEPT (the
 -- custom-model escape hatch — buildDeps('gemini', {model='gemini-custom-xyz'}) keeps that string).
 --
--- Reads the token from the Keychain via readToken (the EXACT LrPasswords.retrieve signature).
--- A nil key / locked keychain / absent token yields a SPEAKING, token-free error (nil, err) and
--- NEVER an env-var fallback. The token value NEVER enters a log line or an error string here.
+-- Reads the token from the Keychain. The DEFAULT (legacy single-key) path uses readToken (the
+-- EXACT LrPasswords.retrieve signature). When opts.storageIndex is a number this is the FAILOVER
+-- seam (DKEY-02): the orchestrator (Plan 11-05) asks the keyring for a storageIndex and passes it
+-- here, so the chosen slot's token (via keystore.readTokenForSlot) flows into deps.token --- one
+-- active key at a time (per-worker key distribution is DEFERRED, D-01). When opts.storageIndex is
+-- absent this is BYTE-COMPATIBLE with the legacy path. Either way a nil key / locked keychain /
+-- absent token yields a SPEAKING, token-free error (nil, err) and NEVER an env-var fallback. The
+-- token value NEVER enters a log line or an error string here.
 -- ---------------------------------------------------------------------------
 function M.buildDeps(provider, prefs, opts)
     local typed = settings.normalizedPrefs(prefs)
@@ -254,7 +260,14 @@ function M.buildDeps(provider, prefs, opts)
     -- keep this provider's catalog model AND a custom string; reset only a stale cross-provider model.
     local model = settings.reconcileModel(provider, typed.model)
 
-    local token, status = M.readToken(provider)
+    -- FAILOVER seam (DKEY-02): a numeric opts.storageIndex resolves the keyring-selected slot via
+    -- keystore.readTokenForSlot; otherwise fall back to the legacy single-key readToken (byte-compat).
+    local token, status
+    if opts and type(opts.storageIndex) == 'number' then
+        token, status = keystore.readTokenForSlot(provider, opts.storageIndex)
+    else
+        token, status = M.readToken(provider)
+    end
     if token == nil then
         local why
         if status == 'no-key' then
