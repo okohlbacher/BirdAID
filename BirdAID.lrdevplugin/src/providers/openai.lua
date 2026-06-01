@@ -175,6 +175,52 @@ function M.new(deps)
         local bodyTable = request.build(builtPrompt, image, deps.model)
         local bodyString = json.encode(bodyTable)
 
+        -- =====================================================================
+        -- SINGLE-ATTEMPT MODE (Plan 11-05, DKEY-02): GUARDED + ADDITIVE. When deps.maxAttempts == 1
+        -- the failover COORDINATOR (src.net.keyring_runner) owns the retry/sleep/failover decision,
+        -- so the provider performs exactly ONE HTTP attempt, does NOT sleep, does NOT loop, and does
+        -- NOT record to the run breaker (the coordinator is the SOLE breaker recorder, D-07). It
+        -- returns the TOKEN-FREE structured table { outcome, status, retryAfter, response, err } so
+        -- the coordinator can split 401/403 (retire) from 400/404/422 (request-error) by the
+        -- reliable HTTP STATUS — never by parsing an opaque err string (D-04). The LEGACY path below
+        -- (deps.maxAttempts absent or > 1) is UNCHANGED and byte-compatible.
+        -- =====================================================================
+        if deps.maxAttempts == 1 then
+            local protect = (type(deps.pcall) == 'function') and deps.pcall or pcall
+            local pok, status, respBody, info = protect(deps.httpPost, ENDPOINT, bodyString, headers)
+            -- On a pcall RAISE, `status` is the raised error string (which may carry the auth header
+            -- value). Force it to nil so the returned status/err is token-free (CODEX MUST-FIX 5).
+            local httpStatus = (pok and status) or nil
+
+            if not pok then
+                -- Transport raise -> a retryable transport error with a CONSTANT token-free err.
+                safeLog(deps, 'warn', 'openai single-attempt transport error (coordinator decides)',
+                    { runId = runId, model = deps.model, error = TRANSPORT_ERR })
+                return { outcome = 'retry', status = nil, retryAfter = nil,
+                         response = nil, err = TRANSPORT_ERR }
+            end
+
+            local classified = backoff.classify(status, respBody, info)
+            if classified.outcome == 'ok' then
+                -- response.map is TOTAL: a contract-valid table or a validated degrade.
+                return { outcome = 'ok', status = httpStatus, retryAfter = nil,
+                         response = response.map(classified.parsed), err = nil }
+            elseif classified.outcome == 'retry' then
+                safeLog(deps, 'info', 'openai single-attempt retryable (coordinator decides failover)',
+                    { runId = runId, status = httpStatus, model = deps.model, error = classified.err })
+                return { outcome = 'retry', status = httpStatus, retryAfter = classified.retryAfter,
+                         response = nil, err = classified.err }
+            else
+                -- classify 'fatal': split by STATUS — 401/403 -> auth-fatal (retire), else
+                -- (400/404/422/other non-auth fatal) -> request-fatal (per-photo error, no failover).
+                local label = (httpStatus == 401 or httpStatus == 403) and 'auth-fatal' or 'request-fatal'
+                safeLog(deps, 'error', 'openai single-attempt fatal (coordinator maps by status)',
+                    { runId = runId, status = httpStatus, model = deps.model, error = classified.err })
+                return { outcome = label, status = httpStatus, retryAfter = nil,
+                         response = nil, err = classified.err }
+            end
+        end
+
         -- The attempt loop. backoff.MAX_ATTEMPTS bounds it; on exhaustion we degrade.
         local attempt = 1
         while true do
