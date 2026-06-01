@@ -73,9 +73,13 @@ end
 -- instantly healthy (no hammer loop).
 -- =====================================================================
 do
-    -- (a) MAX_ATTEMPTS exhaustion: with another healthy slot, exhausted slot is skipped.
+    -- (a) MAX_ATTEMPTS exhaustion: each cooldown bumps the slot's OWN attempt; once the slot's
+    -- attempt reaches MAX_ATTEMPTS, backoff.next(MAX,429,nil).retry==false -> EXHAUSTED.
+    -- With another healthy slot, the exhausted slot is skipped.
     local k = keyring.new({ priorityOrder = { 1, 2 } })
-    k.record(1, 'cooldown', 100, backoff.MAX_ATTEMPTS, nil) -- backoff.next(MAX,429,nil).retry==false
+    for _ = 1, backoff.MAX_ATTEMPTS do
+        k.record(1, 'cooldown', 100, nil, nil)
+    end
     assert_eq(k.select(100), 2, "exhausted slot 1 is skipped at nowTick; healthy slot 2 selected")
     assert_eq(k.state()[1].exhausted, true, "slot 1 state is EXHAUSTED (not cooled to nowTick)")
 
@@ -145,7 +149,7 @@ end
 -- =====================================================================
 do
     local k = keyring.new({ priorityOrder = { 1 } })
-    k.record(1, 'cooldown', 100, backoff.MAX_ATTEMPTS, nil) -- exhausted
+    for _ = 1, backoff.MAX_ATTEMPTS do k.record(1, 'cooldown', 100, nil, nil) end -- exhausted
     assert_eq(k.select(100), nil, "exhausted single slot -> nil")
     k.record(1, 'ok', 100, nil, nil)
     assert_eq(k.select(100), 1, "after 'ok' the slot rejoins as healthy")
@@ -161,19 +165,22 @@ end
 do
     -- Drive a slot through every outcome so state() carries real records.
     local k = keyring.new({ priorityOrder = { 2, 1, 3 } })
-    k.record(1, 'cooldown', 10, 1, nil)
+    k.record(1, 'cooldown', 10, nil, nil)
     k.record(2, 'retire', 10, nil, nil)
-    k.record(3, 'cooldown', 10, backoff.MAX_ATTEMPTS, nil) -- exhausted
+    for _ = 1, backoff.MAX_ATTEMPTS do k.record(3, 'cooldown', 10, nil, nil) end -- exhausted
 
-    -- Recursive walker: for a table, recurse on values AND assert each slot-reference key
-    -- is an integer ordinal; for a string, run visit(s).
-    local function walk(v, visit)
+    -- Recursive walker: for a table, recurse on values; for a string, run visit(s). At the TOP
+    -- (slot-reference) level the snapshot keys MUST be integer storage ordinals; deeper levels
+    -- are per-slot field tables whose keys are field names — so the ordinal assertion is applied
+    -- only at depth 0 (atTop).
+    local function walk(v, visit, atTop)
         if type(v) == 'table' then
             for kk, vv in pairs(v) do
-                -- Every key in the slot snapshot must be an integer storage ordinal.
-                assert_true(type(kk) == 'number' and kk == math.floor(kk),
-                    "every state() key is an integer storage ordinal (got " .. tostring(kk) .. ")")
-                walk(vv, visit)
+                if atTop then
+                    assert_true(type(kk) == 'number' and kk == math.floor(kk),
+                        "every state() key is an integer storage ordinal (got " .. tostring(kk) .. ")")
+                end
+                walk(vv, visit, false)
             end
         elseif type(v) == 'string' then
             visit(v)
@@ -186,7 +193,7 @@ do
         assert_eq(s:find('Bearer ', 1, true), nil, "no 'Bearer ' token value in state/summary string")
     end
 
-    walk(k.state(), assertTokenFree)
+    walk(k.state(), assertTokenFree, true)
 
     -- Representative summary line built from state() — reference slots by ORDINAL only.
     local parts = {}
