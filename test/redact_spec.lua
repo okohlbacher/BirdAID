@@ -155,3 +155,28 @@ assert_true(wq:find('"}', 1, true) ~= nil, "quoted drive path preserves the trai
 -- (26) NO-false-positive regression: a token-free, path-free string is UNCHANGED.
 local clean = "colon: value, ratio 16:9"
 assert_eq(redact(clean), clean, "non-path colon string is returned unchanged (no false positive)")
+
+-- ---- Phase 11 (DKEY-03, SC3): keyring summary no-leak backstop ----
+-- DESIGN GOAL: no keyring code path EVER places a token VALUE into a fields table -- a
+-- summary/log line references a key only by its stable ORDINAL (slot=N). These tests are
+-- the backstop at the single redact sink: (a) ordinals are non-secret and pass through,
+-- (b) IF a token-shaped value ever leaked into such a line, redact masks it.
+
+-- (27) A representative keyring summary line carries the integer ordinal `slot = 2`
+--      (modeled as the encoded fields a summary would log). The ordinal SURVIVES --
+--      ordinals identify a key position, never the secret, so they are safe.
+local ord = redact('keyring select runId=r1 slot=2 status=healthy')
+assert_true(ord:find("2", 1, true) ~= nil, "keyring summary keeps the slot ordinal (non-secret)")
+assert_true(ord:find("slot=2", 1, true) ~= nil, "keyring summary 'slot=2' ordinal passes through")
+
+-- (28) BACKSTOP: a keyring-style line that DID embed a token value is masked at the sink,
+--      proving DKEY-03 even though the design never places a value there. Reuse the same
+--      sk-/sk-ant-/AIza/Bearer fixtures as the existing masking assertions above.
+assert_eq(redact("keyring slot=2 token sk-LEAKABC123"):find("sk%-LEAKABC"), nil,
+    "keyring line with an sk- token-shaped value is masked (backstop)")
+assert_eq(redact("keyring slot=3 sk-ant-LEAKANT9"):find("LEAKANT9"), nil,
+    "keyring line with an sk-ant- token-shaped value is masked (backstop)")
+assert_eq(redact("keyring slot=1 AIzaSyLEAK-KEY"):find("SyLEAK%-KEY"), nil,
+    "keyring line with an AIza token-shaped value is masked (backstop)")
+assert_eq(redact("keyring slot=2 Authorization: Bearer leak.tok.val"):find("leak%.tok%.val"), nil,
+    "keyring line with a Bearer value is masked (backstop)")
