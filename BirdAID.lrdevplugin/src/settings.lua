@@ -388,4 +388,34 @@ function M.tokenKeyFor(provider)
     return p.value .. "_api_token"
 end
 
+-- tokenKeyForSlot(provider, storageIndex) [DKEY-01] -> the STABLE per-slot Keychain key
+-- string, or nil. PURE (no Lr, no os.*, no math.random; math.floor only).
+--   slot 1   == the bare legacy <provider>_api_token (delegates to tokenKeyFor) -- the
+--              slot-1 anchor (D-09 / Pitfall 2): a prior single-key install is NEVER
+--              renamed, so its stored token is never orphaned on upgrade.
+--   slot 2+  == "<provider>_api_token_2", "_3", ... (suffix from a verified integer).
+-- The index is VALIDATED FIRST: a non-number, a non-integer (e.g. 2.5 -- the LOW fix, so
+-- no "openai_api_token_2.5" key can be built), or an index < 1 all return nil. Because the
+-- index is then a verified integer, tostring(2) is "2" (never "2.0"/"2.5"). An unknown or
+-- injection-shaped provider returns nil via tokenKeyFor's providerByValue gate.
+function M.tokenKeyForSlot(provider, storageIndex)
+    local base = M.tokenKeyFor(provider)
+    if base == nil then return nil end
+    -- Integer guard FIRST (LOW fix): number, exact integer, and >= 1.
+    if type(storageIndex) ~= "number" then return nil end
+    if storageIndex ~= math.floor(storageIndex) then return nil end
+    if storageIndex < 1 then return nil end
+    if storageIndex == 1 then return base end   -- legacy slot-1 id, unchanged (no rename)
+    return base .. "_" .. tostring(storageIndex) -- "<provider>_api_token_2", "_3", ...
+end
+
+-- needsMigration(keyOrderPref, slot1Status) [DKEY-01 / D-10] -> bool. PURE idempotent
+-- predicate behind the silent one-time migration: seed the priority order EXACTLY ONCE
+-- when slot 1 already holds a token but no order pref exists yet; never re-seed once
+-- keyOrder_<provider> is present (Pitfall 3). slot1Status is the value produced by the
+-- existing M.tokenStatus(ok, val) -- do NOT re-classify here.
+function M.needsMigration(keyOrderPref, slot1Status)
+    return keyOrderPref == nil and slot1Status == "set"
+end
+
 return M
