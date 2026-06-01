@@ -81,6 +81,10 @@ local providers      = require 'src.providers.init'    -- the GENERIC provider s
 local previewFetch   = require 'src.lr.preview_fetch'
 local metadataReader = require 'src.lr.metadata_reader'
 local catalogWriter  = require 'src.lr.catalog_writer'
+local keystore       = require 'src.lr.keystore'        -- multi-slot secret layer + silent migration
+local keyring        = require 'src.net.keyring'        -- PURE per-slot health/selection state machine
+local keyringRunner  = require 'src.net.keyring_runner'  -- PURE failover coordinator (DKEY-02)
+local backoff        = require 'src.net.backoff'         -- PURE single-key per-attempt sleep fallback
 
 -- Per-invocation monotonic counter so even two newRunId() calls within the SAME fractional
 -- instant (or with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives
@@ -196,6 +200,86 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     -- (No crop pass: detection + species are fully cloud-side from the preview — cross-platform,
     -- no external image tool. The previous EXPERIMENTAL macOS-only crop-for-ID was removed.)
 
+    -- ===========================================================================
+    -- MULTI-KEY FAILOVER (Plan 11-05, DKEY-02/DKEY-03) — FAILOVER-ONLY, ONE ACTIVE SLOT (D-01).
+    -- ===========================================================================
+    -- Build the priority order from keyOrder_<provider> (silently migrated on the settings open;
+    -- migrate here too so a never-opened-settings run still upgrades the legacy single key). Only
+    -- slots whose Keychain status is 'set' (a real, populated key) are eligible — a row the user
+    -- added but never saved a key into must never be selected.
+    --
+    -- INVARIANT (D-01): exactly ONE active key is in flight at a time, RUN-WIDE. When more than one
+    -- populated key exists we FORCE the SERIAL path (the failover coordinator drives one attempt at
+    -- a time; the Phase-9 parallel staged pool would lease DIFFERENT keys to concurrent workers,
+    -- which is accidental DISTRIBUTION — DEFERRED to Phase 17/deep-ID). When <= 1 populated key
+    -- exists we behave EXACTLY as today (the provider's own retry loop, NO maxAttempts cap,
+    -- byte-compatible — no coordinator).
+    pcall(function() keystore.migrateIfNeeded(prefs.provider, rawPrefs) end)
+    local priorityOrder = {}
+    do
+        local order = rawPrefs['keyOrder_' .. tostring(prefs.provider)]
+        if type(order) == 'table' then
+            for p = 1, #order do
+                local storageIndex = order[p]
+                if type(storageIndex) == 'number' then
+                    local okS, st = pcall(function()
+                        return keystore.statusForSlot(prefs.provider, storageIndex)
+                    end)
+                    if okS and st == 'set' then
+                        priorityOrder[#priorityOrder + 1] = storageIndex
+                    end
+                end
+            end
+        end
+    end
+    local multiKey = (#priorityOrder > 1)
+
+    -- An integer monotonic tick source for the keyring's deterministic select/record. LrDate gives
+    -- fractional seconds; floor to an integer tick. Falls back to os.time(), then a counter. This
+    -- now() is the keyring's clock (cooldown windows are measured against it); it advances in real
+    -- time so a slept-out cooldown becomes selectable again on the next select.
+    local function keyringNow()
+        local okF, f = pcall(function() return LrDate.currentTime() end)
+        if okF and type(f) == 'number' and f == f then return math.floor(f) end
+        local okT, t = pcall(os.time)
+        if okT and type(t) == 'number' then return t end
+        return 0
+    end
+
+    -- attemptOnce(storageIndex) -> the STRUCTURED single-attempt result { outcome, status,
+    -- retryAfter, response, err } for the per-photo failover coordinator. It rebuilds the per-slot
+    -- deps via http.buildDeps(provider, rawPrefs, { storageIndex }) with deps.maxAttempts = 1 (the
+    -- provider single-attempt mode), resolves the provider, and returns the provider's structured
+    -- result DIRECTLY (NEVER collapsing it to (nil, err) and losing the reliable HTTP status). The
+    -- closure captures the per-photo image/ctx set just before keyringRunner.run is called.
+    local attemptImage, attemptCtx
+    local function attemptOnce(storageIndex)
+        local slotDeps, sderr = http.buildDeps(prefs.provider, rawPrefs, { storageIndex = storageIndex })
+        if not slotDeps then
+            -- A slot that cannot build deps (e.g. its key vanished mid-run) is a transient retry so
+            -- the coordinator fails over to the next healthy slot. Token-free err.
+            return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                     error = nil, err = 'slot-deps-unavailable' }
+        end
+        slotDeps.maxAttempts = 1     -- single-attempt mode: the coordinator owns retry/sleep/failover.
+        slotDeps.breaker = breaker   -- present but UNUSED in single-attempt mode (provider bypasses it).
+        local slotProvider, sperr = providers.get(prefs.provider, slotDeps)
+        if not slotProvider then
+            return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                     err = 'slot-provider-unavailable' }
+        end
+        local r = slotProvider.identify(attemptImage, attemptCtx)
+        if type(r) == 'table' and r.outcome ~= nil then
+            return r   -- the structured single-attempt result (status preserved for the split).
+        end
+        -- Defensive: a provider that somehow returned the legacy (response)|(nil,err) shape. Wrap it
+        -- token-free so the coordinator still has a usable outcome (status absent -> treated retry).
+        if type(r) == 'table' then
+            return { outcome = 'ok', status = 200, retryAfter = nil, response = r, err = nil }
+        end
+        return { outcome = 'retry', status = nil, retryAfter = nil, response = nil, err = 'identify-failed' }
+    end
+
     local progress = LrProgressScope({
         title           = "BirdAID: identifying birds",
         functionContext = context,   -- ties the scope lifetime to this task.
@@ -256,8 +340,40 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         local ctx = job.ctx
         local previewImage = job.image
 
-        -- ---- LIVE identify on the preview (generic provider) -------------
-        local det, ierr = provider.identify(previewImage, ctx)
+        -- ---- LIVE identify on the preview -------------------------------
+        -- MULTI-KEY (>1 populated key): drive the per-photo failover COORDINATOR (one active slot,
+        -- immediate failover, no concurrent distribution — D-01). attemptOnce reads result.status/
+        -- result.outcome to drive the keyring record (retire vs request-error vs cooldown) off the
+        -- RELIABLE HTTP status, NOT an opaque err string (D-04). The coordinator records breaker
+        -- 'exhausted' only when keyring.select() returns nil (D-07).
+        -- SINGLE-KEY (<= 1 populated key): the legacy direct provider.identify path (the provider's
+        -- own retry loop, NO maxAttempts cap) — byte-compatible with today.
+        local det, ierr
+        if multiKey then
+            local kr = keyring.new({ priorityOrder = priorityOrder })
+            attemptImage, attemptCtx = previewImage, ctx
+            local result = keyringRunner.run({
+                keyring       = kr,
+                attemptOnce   = attemptOnce,
+                now           = keyringNow,
+                sleep         = LrTasks.sleep,
+                breaker       = breaker,
+                backoff       = backoff,
+                priorityCount = #priorityOrder,
+            })
+            attemptImage, attemptCtx = nil, nil
+            if type(result) == 'table' and result.response ~= nil then
+                det, ierr = result.response, nil
+            else
+                -- request-fatal / all-keys-down (defer/degrade): surface the token-free err (or a
+                -- generic deferral) so the per-photo result records an honest skip. NO token, NO
+                -- physical-key identity — the coordinator already returns ordinal-only results.
+                det = nil
+                ierr = (type(result) == 'table' and result.err) or 'identify-deferred'
+            end
+        else
+            det, ierr = provider.identify(previewImage, ctx)
+        end
 
         -- RE-validate (defence in depth). A degrade {bird_present=false} is valid.
         local previewResult, verr = nil, nil
@@ -300,8 +416,19 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     -- The REAL dispatch decision lives in orchestrate.dispatch (spec-driven): at defaults it runs
     -- runSerial and NEVER runFeatures, so the feature modules' LAZY requires (inside runFeatures)
     -- never load. Any feature ON runs runFeatures (the spec-tested orchestrate.runFeatures sequence).
+    --
+    -- SINGLE-ACTIVE-SLOT INVARIANT (D-01): a MULTI-KEY run (>1 populated key) FORCES the SERIAL
+    -- path even when a Phase-9 feature is on, because the parallel staged pool would lease DIFFERENT
+    -- keys to concurrent workers (accidental concurrent DISTRIBUTION). Concurrent key distribution
+    -- across parallel workers is DEFERRED (Phase 17/deep-ID). We OR multiKey into the bypass
+    -- predicate so the failover coordinator always runs one active key at a time, run-wide.
+    if multiKey and not featuresOff then
+        log.info("multi-key failover: forcing the serial path (one active slot; distribution deferred)", {
+            runId = runId, provider = prefs.provider, keys = #priorityOrder,
+        })
+    end
     orchestrate.dispatch({
-        featuresOff = featuresOff,
+        featuresOff = featuresOff or multiKey,
         runSerial = function()
         -- =======================================================================
         -- DEFAULT-SAFE HARD BYPASS — the EXISTING serial loop, VERBATIM. NO feature module is
