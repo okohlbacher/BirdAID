@@ -298,6 +298,53 @@ assert_eq(S.tokenKeyFor("openai\nx"), nil, "tokenKeyFor newline-injected -> nil"
 assert_eq(S.tokenKeyFor("../x"), nil, "tokenKeyFor path-traversal-shaped -> nil")
 
 -- =====================================================================
+-- DKEY-01: tokenKeyForSlot (no-orphaning multi-slot naming + integer guard)
+-- =====================================================================
+-- Slot 1 == the bare legacy <provider>_api_token (D-09 / Pitfall 2): a prior
+-- single-key install is NEVER renamed, so its stored token is never orphaned.
+assert_eq(S.tokenKeyForSlot("openai", 1), S.tokenKeyFor("openai"),
+    "tokenKeyForSlot slot 1 == legacy tokenKeyFor (slot-1 anchor, no rename)")
+assert_eq(S.tokenKeyForSlot("openai", 1), "openai_api_token",
+    "tokenKeyForSlot('openai',1) == 'openai_api_token'")
+assert_eq(S.tokenKeyForSlot("claude", 1), "claude_api_token",
+    "tokenKeyForSlot('claude',1) == 'claude_api_token'")
+
+-- Slot 2+ == suffixed <provider>_api_token_N.
+assert_eq(S.tokenKeyForSlot("openai", 2), "openai_api_token_2",
+    "tokenKeyForSlot('openai',2) == 'openai_api_token_2'")
+assert_eq(S.tokenKeyForSlot("openai", 3), "openai_api_token_3",
+    "tokenKeyForSlot('openai',3) == 'openai_api_token_3'")
+assert_eq(S.tokenKeyForSlot("gemini", 2), "gemini_api_token_2",
+    "tokenKeyForSlot('gemini',2) == 'gemini_api_token_2'")
+
+-- nil-guards: unknown/injection provider, idx<1, non-number.
+assert_eq(S.tokenKeyForSlot("openai", 0), nil, "tokenKeyForSlot idx 0 -> nil")
+assert_eq(S.tokenKeyForSlot("openai", "x"), nil, "tokenKeyForSlot non-number idx -> nil")
+assert_eq(S.tokenKeyForSlot("openai", nil), nil, "tokenKeyForSlot nil idx -> nil")
+assert_eq(S.tokenKeyForSlot("nope", 2), nil, "tokenKeyForSlot unknown provider -> nil")
+assert_eq(S.tokenKeyForSlot("openai\nx", 2), nil, "tokenKeyForSlot injection provider -> nil")
+assert_eq(S.tokenKeyForSlot(nil, 1), nil, "tokenKeyForSlot nil provider -> nil")
+
+-- INTEGER GUARD (LOW fix): a fractional or negative index must NOT build a key.
+assert_eq(S.tokenKeyForSlot("openai", 2.5), nil,
+    "tokenKeyForSlot('openai',2.5) -> nil (no 'openai_api_token_2.5')")
+assert_eq(S.tokenKeyForSlot("openai", -1), nil,
+    "tokenKeyForSlot('openai',-1) -> nil (negative index rejected)")
+
+-- =====================================================================
+-- DKEY-01: needsMigration (idempotent silent-migration predicate, D-10)
+-- =====================================================================
+-- slot1Status is the value produced by S.tokenStatus(ok, val); not re-classified here.
+assert_eq(S.needsMigration(nil, "set"), true,
+    "needsMigration: slot 1 set + no order pref -> true (seed once)")
+assert_eq(S.needsMigration({ 1 }, "set"), false,
+    "needsMigration: order pref already present -> false (idempotent)")
+assert_eq(S.needsMigration(nil, "absent"), false,
+    "needsMigration: slot 1 absent -> false")
+assert_eq(S.needsMigration(nil, "keychain_error"), false,
+    "needsMigration: keychain_error -> false")
+
+-- =====================================================================
 -- NIT: DISCLOSURE_TEXT
 -- =====================================================================
 assert_true(type(S.DISCLOSURE_TEXT) == "string" and S.DISCLOSURE_TEXT ~= "",
