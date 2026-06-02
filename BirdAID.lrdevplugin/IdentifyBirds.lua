@@ -81,6 +81,9 @@ local providers      = require 'src.providers.init'    -- the GENERIC provider s
 local previewFetch   = require 'src.lr.preview_fetch'
 local metadataReader = require 'src.lr.metadata_reader'
 local catalogWriter  = require 'src.lr.catalog_writer'
+local batcher        = require 'src.batcher'            -- WBATCH: cumulative-diff batched flush (PURE)
+local runState       = require 'src.run_state'          -- PURE OUTCOME taxonomy + outcomeFor classifier
+local runStateStore  = require 'src.lr.run_state_store'  -- RETRY: cross-session run-state persistence (glue)
 local keystore       = require 'src.lr.keystore'        -- multi-slot secret layer + silent migration
 local keyring        = require 'src.net.keyring'        -- PURE per-slot health/selection state machine
 local keyringRunner  = require 'src.net.keyring_runner'  -- PURE failover coordinator (DKEY-02)
@@ -524,14 +527,29 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             return os.time()
         end
 
+        -- previewByKey[anchorKey] = { bytes, frameW, frameH } — the SMALL preview bytes/dims fetched
+        -- by the MAIN pass, CARRIED FORWARD so the gallery report can render WITHOUT a second fetch
+        -- (THRU-01 / CODEX MEDIUM-3 eliminates the old per-photo report re-fetch). Keyed by anchor
+        -- key (only anchors are fetched; a follower has no own bytes and renders box-only — gallery
+        -- handles a nil uri). NEVER logged; lives only in memory for this run.
+        local previewByKey = {}
+
         -- producerFetch(anchorKey) -> job | (nil, reason): MAIN-TASK serial preview fetch (the
-        -- reliable, one-render-at-a-time path). Stamps job.atIndex for the identify-side logs.
+        -- reliable, one-render-at-a-time path). Stamps job.atIndex for the identify-side logs and
+        -- CAPTURES the preview bytes/dims for the carried-forward gallery (no report re-fetch).
         local function producerFetch(anchorKey)
             local photo = photoByKey[anchorKey]
             if photo == nil then return nil, 'no-photo-for-anchor' end
             local job, reason = fetchJob(photo, anchorKey)
             if job == nil then return nil, reason end
             job.atIndex = anchorKey
+            if type(job.image) == 'table' then
+                previewByKey[anchorKey] = {
+                    bytes  = job.image.data,
+                    frameW = job.image.width,
+                    frameH = job.image.height,
+                }
+            end
             return job
         end
 
@@ -648,58 +666,35 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- the gate. The orphan-sweep already ran UNCONDITIONALLY at step 0 -- do NOT re-sweep here.
         -- Guarded per photo; never blocks the run; cancel-aware.
         if prefs.showDetectionReport == true and prefs.dryRun ~= true then
-            -- The report opens ONE browser tab per detected photo. Count eligible photos FIRST and
-            -- SUPPRESS the entire report above a small cap, so a bulk run never floods the browser
-            -- with dozens/hundreds of tabs (BL-13: a single combined gallery is the proper fix).
-            local REPORT_OPEN_LIMIT = 20
-            local eligible = 0
+            -- GAL-01: ONE combined gallery page, regardless of selection size (the old 20-tab cap is
+            -- GONE). THRU-01 / CODEX MEDIUM-3: build the photos array from the CARRIED-FORWARD preview
+            -- bytes/dims (previewByKey, captured during the main fetch pass) — NO per-photo re-fetch.
+            -- A follower (no own bytes) renders box-only (gallery handles a nil uri). Still OUTSIDE any
+            -- write gate; the single writeGalleryAndOpen runs inside the existing yield-safe LrTasks.pcall.
+            local galleryPhotos = {}
             for ei = 1, #fr.results do
-                local r = fr.results[ei]
-                if type(r.response) == 'table' and type(r.response.detections) == 'table'
-                    and #r.response.detections > 0 then
-                    eligible = eligible + 1
+                local entry = fr.results[ei]
+                local resp = entry.response
+                if type(resp) == 'table' and type(resp.detections) == 'table'
+                    and #resp.detections > 0 then
+                    local carried = previewByKey[entry.photoKey] or {}
+                    galleryPhotos[#galleryPhotos + 1] = {
+                        previewBytes = carried.bytes,
+                        frameW       = carried.frameW,
+                        frameH       = carried.frameH,
+                        response     = resp,
+                        file         = photoName(entry.photo),
+                    }
                 end
             end
-            if eligible > REPORT_OPEN_LIMIT then
-                reportNote = string.format(
-                    "Detection report not opened: %d photos have detections (limit %d). "
-                    .. "Re-run on a smaller selection to view the report.",
-                    eligible, REPORT_OPEN_LIMIT)
-                log.warn("detection report suppressed (too many to open)", {
-                    runId = runId, eligible = eligible, limit = REPORT_OPEN_LIMIT,
-                })
-            else
-                local repIdx = 0
-                for ei = 1, #fr.results do
-                    if cancelled(progress) then break end
-                    local entry = fr.results[ei]
-                    local resp = entry.response
-                    if type(resp) == 'table' and type(resp.detections) == 'table'
-                        and #resp.detections > 0 then
-                        repIdx = repIdx + 1
-                        local photo = entry.photo
-                        local file = photoName(photo)
-                        -- Re-fetch the small preview bytes + dims for the report (OUTSIDE the gate).
-                        -- YIELD-SAFE: previewFetch.fetch yields (LrTasks.sleep) and vizReport.writeAndOpen
-                        -- may LrTasks.execute (open) — both yield across a C frame, so this MUST be the
-                        -- yield-safe LrTasks.pcall, NEVER a standard C pcall (Lua 5.1 forbids yielding
-                        -- across a standard pcall boundary).
-                        LrTasks.pcall(function()
-                            local transport = previewFetch.fetch(photo, maxEdge, {
-                                isCanceled = function() return cancelled(progress) end,
-                                file = file, runId = runId,
-                            })
-                            local bytes, fw, fh
-                            if type(transport) == 'table' then
-                                bytes = transport.data; fw = transport.width; fh = transport.height
-                            end
-                            vizReport.writeAndOpen({
-                                runId = runId, idx = repIdx, previewBytes = bytes,
-                                frameW = fw, frameH = fh, response = resp, prefs = prefs, file = file,
-                            })
-                        end)
-                    end
-                end
+            if #galleryPhotos > 0 then
+                -- YIELD-SAFE: writeGalleryAndOpen may LrTasks.execute (open) — yields across a C
+                -- frame, so this MUST be the yield-safe LrTasks.pcall, never a standard C pcall.
+                LrTasks.pcall(function()
+                    vizReport.writeGalleryAndOpen({
+                        runId = runId, photos = galleryPhotos, prefs = prefs,
+                    })
+                end)
             end
         end
         end,   -- runFeatures
@@ -729,13 +724,91 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             runId = runId, photoCount = #entries, totalKeywordsToAdd = totalAdds, dryRun = true,
         })
     else
-        writeResult = catalogWriter.apply(
-            catalog,
-            report.plan,
-            "BirdAID: write bird keywords",
-            { runId = runId },
-            { pcall = LrTasks.pcall }   -- yield-safe outer gate wrap (withWriteAccessDo yields)
-        )
+        -- BATCHED FLUSH (WBATCH-01/02): route the write through batcher.flushAll. At
+        -- writeBatchSize=0 (default) slice yields exactly ONE chunk == today's single apply
+        -- (default-safe, spy-asserted). The applyFn closure reproduces the EXACT shipped
+        -- catalogWriter.apply 5-arg signature per chunk and RETURNS its status string so flushAll
+        -- gates the cross-batch fold on a committed success (CODEX HIGH-1/HIGH-2). flushAll's own
+        -- body (slicing, cumulative diff) runs OUTSIDE any catalog write gate; the ONLY thing that
+        -- enters the encapsulated catalog_writer gate is catalogWriter.apply inside this closure
+        -- (CLAUDE.md HARD CONSTRAINT — no gallery/flush logic is nested in the gate).
+        local function applyFn(plan, _chunkReport)
+            return catalogWriter.apply(
+                catalog,
+                plan,
+                "BirdAID: write bird keywords",
+                { runId = runId },
+                { pcall = LrTasks.pcall }   -- yield-safe outer gate wrap (the gate yields internally)
+            )
+        end
+        local flush = batcher.flushAll(results, prefs, applyFn)
+        -- Authoritative writeResult for the summary: 'error' if ANY chunk errored, else the last
+        -- committed status (executed/noop). A single-chunk run is byte-identical to today.
+        writeResult = 'noop'
+        local statuses = (type(flush) == 'table' and type(flush.statuses) == 'table') and flush.statuses or {}
+        for si = 1, #statuses do
+            local s = statuses[si]
+            if s == 'error' then writeResult = 'error'; break end
+            writeResult = s
+        end
+    end
+
+    -- ---- RETRY-01: persist the per-photo TERMINAL/RETRYABLE run-state (cross-session) ----------
+    -- Build a { photoId = uuid, outcome } record for every collected photo via the PURE classifier
+    -- run_state.outcomeFor (the SINGLE source of the status->outcome mapping — NEVER re-derived
+    -- inline here). photoId is the per-photo catalog uuid (run_state_store.stableIdFor; a nil-uuid
+    -- photo is NON-RESUMABLE and dropped by save). On a non-dry-run we persist this run's state so a
+    -- later run can re-process only the incomplete photos; the retry SELECTION at run start is gated
+    -- behind an explicit pref so a NORMAL run is byte-unchanged (default-safe). On a fully successful
+    -- run (no retryable photo, no breaker defer) we clear the persisted state.
+    if report.dryRun ~= true then
+        -- wroteByKey[photoKey] = number of keywords PLANNED for this photo this run (== written on a
+        -- committed apply). Sourced from the authoritative whole-run plan (report.plan), not inline.
+        local wroteByKey = {}
+        for ei = 1, #report.plan.entries do
+            local e = report.plan.entries[ei]
+            local names = (type(e.addKeywords) == 'table') and e.addKeywords or {}
+            wroteByKey[e.photoKey] = #names
+        end
+
+        local records = {}
+        local anyRetryable = false
+        for ri = 1, #results do
+            local rec = results[ri]
+            local resp = rec.response
+            local status
+            if type(resp) == 'table' then
+                status = 'identified'
+            else
+                status = 'errored'   -- a collected record with no response is a retryable error
+            end
+            local birdPresent = (type(resp) == 'table') and resp.bird_present or nil
+            local detectionCount = (type(resp) == 'table' and type(resp.detections) == 'table')
+                and #resp.detections or 0
+            local outcome = runState.outcomeFor({
+                status         = status,
+                birdPresent    = birdPresent,
+                detectionCount = detectionCount,
+                wroteCount     = wroteByKey[rec.photoKey] or 0,
+            })
+            if outcome ~= nil then
+                if not runState.isTerminal(outcome) then anyRetryable = true end
+                records[#records + 1] = {
+                    photoId = runStateStore.stableIdFor(rec.photo),   -- uuid or nil (NON-RESUMABLE)
+                    outcome = outcome,
+                }
+            end
+        end
+
+        -- A run is fully successful (nothing to resume) only when no photo is retryable AND nothing
+        -- was deferred/cancelled at the run level. Otherwise persist the incomplete-set.
+        local fullyDone = (not anyRetryable) and (deferred == 0) and (cancelledCnt == 0)
+            and (not wasCancelled)
+        if fullyDone then
+            pcall(function() runStateStore.clear() end)
+        else
+            pcall(function() runStateStore.save(runId, records) end)
+        end
     end
 
     local bstate = breaker.state()
@@ -765,6 +838,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         .. "\nwriteResult: " .. tostring(writeResult)
         .. "  |  breaker open: " .. tostring(bstate.open)
         .. "  |  deferred: " .. tostring(deferred)
+        .. (peakConcurrency and ("  |  peak concurrency: " .. tostring(peakConcurrency)) or "")
         .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
         .. (wasCancelled and "  (cancelled)" or "")
         .. (reportNote and ("\n\n" .. reportNote) or "")

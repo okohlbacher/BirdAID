@@ -56,6 +56,7 @@ local svg     = require 'src.viz.svg'
 local fileUrl = require 'src.viz.file_url'
 local keyword = require 'src.keyword'
 local sweep   = require 'src.crop.sweep'
+local gallery = require 'src.viz.gallery'   -- GAL-01: ONE combined page over N svg bodies
 local log     = require 'src.log'
 
 local M = {}
@@ -280,6 +281,99 @@ function M.writeAndOpen(opts)
     end
 
     return { path = outPath, opened = opened, detections = #detections }
+end
+
+-- ---------------------------------------------------------------------------
+-- writeGalleryAndOpen(opts) -> { path = <abs gallery path>, opened = <bool>, photos = <n> } | (nil, reason)
+--
+-- GAL-01: write ONE combined gallery page (regardless of selection size — the 20-tab cap is gone)
+-- and open ONE browser tab. Mirrors writeAndOpen EXACTLY (write -> percent-escaped file:// via
+-- fileUrl.pathToFileUrl, NO raw concat -> guarded open -> token-free warn + RETURN path on failure)
+-- but renders the COMBINED gallery.render(photos) instead of one per-photo svg.
+--
+-- opts = {
+--   runId  = <string>,        -- run correlation id (drives the report dir name)
+--   prefs  = <typed prefs>,   -- for keyword.decide (confidence threshold + promptAddition)
+--   photos = {                -- one entry per DETECTED photo, in selection order
+--     { previewBytes = <jpeg bytes|nil>,  -- the SMALL preview ALREADY fetched in the main pass
+--       frameW = <number>, frameH = <number>,  -- parsed preview dims (carried forward; NO re-fetch)
+--       response = <contract-valid identify response>,
+--       file = <string> },    -- loggable formatted filename (token-free); used as the section label
+--     ...
+--   },
+-- }
+--
+-- THRU-01 / CODEX MEDIUM-3: previewBytes are CARRIED FORWARD from the main fetch — this function
+-- NEVER re-fetches a preview. A photo whose bytes were not retained renders without a base image
+-- (gallery handles a nil uri). It REUSES dataUri (jpeg base64) + buildDetections (the SAME keyword
+-- rendering the catalog write uses) so the gallery shows EXACTLY what would be written.
+-- ---------------------------------------------------------------------------
+function M.writeGalleryAndOpen(opts)
+    opts = type(opts) == 'table' and opts or {}
+    local runId = opts.runId
+    local prefs = opts.prefs
+    local photosIn = type(opts.photos) == 'table' and opts.photos or {}
+
+    local dir, derr = M.reportDir(runId)
+    if not dir then
+        log.warn("report dir unavailable (skipping gallery)", {
+            runId = runId, reason = tostring(derr),
+        })
+        return nil, derr
+    end
+
+    -- Assemble the PURE gallery input array: each section carries the vetted-by-gallery raster
+    -- data-URI (from the carried-forward preview bytes), the parsed dims, the per-detection labels,
+    -- and the token-free file label. The gallery itself xml-escapes every dynamic string.
+    local galleryPhotos = {}
+    for i = 1, #photosIn do
+        local p = photosIn[i]
+        if type(p) == 'table' then
+            galleryPhotos[#galleryPhotos + 1] = {
+                frameW       = p.frameW,
+                frameH       = p.frameH,
+                imageDataUri = dataUri(p.previewBytes),   -- nil when bytes were not retained (no re-fetch)
+                detections   = buildDetections(p.response, prefs),
+                label        = type(p.file) == 'string' and p.file or '(unknown file)',
+            }
+        end
+    end
+
+    local htmlStr = gallery.render(galleryPhotos)
+
+    -- Write the ONE combined gallery file into the dedicated report dir.
+    local outPath = LrPathUtils.child(dir, 'gallery.html')
+    local f = io.open(outPath, 'wb')
+    if not f then
+        log.warn("gallery file write failed (skipping report)", {
+            runId = runId, reason = 'gallery-write-failed',
+        })
+        return nil, 'gallery-write-failed'
+    end
+    f:write(htmlStr)
+    f:close()
+
+    -- Build the PERCENT-ESCAPED file:// URL (PURE; NO raw concat) and open it ONCE (guarded).
+    local url = fileUrl.pathToFileUrl(outPath)
+    local opened = false
+    if url then
+        local okOpen = pcall(function() LrHttp.openUrlInBrowser(url) end)
+        opened = okOpen and true or false
+    end
+
+    if not opened then
+        -- A-VIZ fallback: the gallery file is written; the open failed (or the path was unescapable).
+        -- Surface the PATH to the orchestrator (returned, NOT logged) for manual open. Token-free log.
+        log.warn("gallery written but could not open in browser (open it manually from the path)", {
+            runId = runId, reportLeaf = M.reportDirName(runId), photos = #galleryPhotos,
+        })
+    else
+        log.info("gallery written + opened in browser", {
+            runId = runId, reportLeaf = M.reportDirName(runId), photos = #galleryPhotos,
+        })
+    end
+
+    return { path = outPath, opened = opened, photos = #galleryPhotos }
 end
 
 return M
