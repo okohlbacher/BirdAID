@@ -168,3 +168,38 @@ do
     })
     assert_eq(out.statusByAnchorKey.a, 'deferred', "staged: consumer 'deferred' status preserved")
 end
+
+-- (7) THRU-01: run() surfaces a NUMERIC peakConcurrency, and the bounded look-ahead NEVER exceeds
+-- the concurrency cap. A scheduler that DEFERS every spawn (yield is a no-op; sleep drains the
+-- oldest pending consumer) lets consumers accumulate up to the backpressure cap before a drain, so
+-- the OBSERVED peak is the tightest evidence the look-ahead is bounded. We drive a larger run
+-- (8 items, cap 3) and assert peak is a number in [1, cap] — never exceeding maxConcurrency.
+do
+    local s = newSched()
+    local out = staged.run({
+        items = { 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h' },
+        maxConcurrency = 3,
+        fetchJob = function(k) return { key = k } end,
+        identifyJob = function() return 'identified', {} end,
+        spawn = s.spawn, sleep = s.sleep, yield = s.yield,
+    })
+    assert_true(keysResolved(out, { 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h' }), "THRU-01: all 8 resolved")
+    assert_eq(type(out.peakConcurrency), 'number', "THRU-01: peakConcurrency is numeric")
+    assert_true(out.peakConcurrency >= 1, "THRU-01: peakConcurrency is at least 1")
+    assert_true(out.peakConcurrency <= 3, "THRU-01: bounded look-ahead NEVER exceeds maxConcurrency (cap 3)")
+end
+
+-- (7b) THRU-01: with maxConcurrency = 1 (the DEFAULT-SAFE serial path) the observed peak is exactly
+-- 1 — the look-ahead never runs more than one consumer at a time.
+do
+    local s = newSched()
+    local out = staged.run({
+        items = { 'a', 'b', 'c', 'd' },
+        maxConcurrency = 1,
+        fetchJob = function(k) return { key = k } end,
+        identifyJob = function() return 'identified', {} end,
+        spawn = s.spawn, sleep = s.sleep, yield = s.yield,
+    })
+    assert_true(keysResolved(out, { 'a', 'b', 'c', 'd' }), "THRU-01: all 4 resolved (serial)")
+    assert_eq(out.peakConcurrency, 1, "THRU-01: serial cap -> peakConcurrency exactly 1")
+end
