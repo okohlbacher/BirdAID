@@ -158,6 +158,10 @@ M.DEFAULTS = {
     -- (Phase 9 — Throughput/Cluster/Viz): greenlit v1.0 features, all OFF/serial by default.
     -- BL-06 — parallel AI requests via a cooperative worker pool. THE single throughput knob.
     maxConcurrency      = 1,      -- integer 1..50; DEFAULT 1 = the existing serial code path.
+    -- BL-14 (12-01 WBATCH) — incremental keyword-flush batch size.
+    -- 0/absent => single end-of-run write (byte-for-byte today, default-safe per RESEARCH A5);
+    -- >=1 => batch flush ~25.
+    writeBatchSize      = 0,
     -- BL-07 — burst/stack clustering: ONE anchor per cluster identifies; followers inherit.
     clusterBursts       = false,  -- DEFAULT OFF (serial-equivalent default-safe HARD bypass).
     clusterMaxGapSeconds = 1.0,   -- number 0..30 sec; max inter-frame gap to time-cluster.
@@ -233,6 +237,9 @@ function M.validate(key, value)
     if key == "previewSize" then return clampNumber(value, 512, 8192, 2048) end
     -- BL-06 maxConcurrency is an INTEGER count 1..50 default 1 (floored, never fractional).
     if key == "maxConcurrency" then return clampInt(value, 1, 50, 1) end
+    -- 12-01: BL-14 writeBatchSize is an INTEGER batch count 0..100000 default 0 (clampInt, NOT
+    -- clampNumber — a batch count is never fractional; 0 = single end-of-run write, default-safe).
+    if key == "writeBatchSize" then return clampInt(value, 0, 100000, 0) end
     -- 09-01: BL-07 clusterMaxGapSeconds is a number 0..30 sec default 1.0.
     if key == "clusterMaxGapSeconds" then return clampNumber(value, 0, 30, 1.0) end
     -- 09-01: BL-07 clusterSimilarityThreshold is an INTEGER Hamming distance over the 64-bit aHash,
