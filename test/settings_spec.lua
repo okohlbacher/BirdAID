@@ -550,6 +550,30 @@ assert_eq(S.validate("clusterSimilarityThreshold", 0/0), 10,
 assert_eq(type(S.validate("clusterSimilarityThreshold", 12)), "number",
     "clusterSimilarityThreshold is a number")
 
+-- =====================================================================
+-- 12-01 (WBATCH-01): writeBatchSize — integer keyword-flush batch size, clamp 0..100000,
+-- floors floats, default 0 (= single end-of-run write, default-safe). Mirrors maxConcurrency.
+-- =====================================================================
+assert_eq(S.DEFAULTS.writeBatchSize, 0, "default writeBatchSize is 0 (single end-of-run write)")
+assert_eq(S.validate("writeBatchSize", 25), 25, "writeBatchSize 25 kept")
+assert_eq(type(S.validate("writeBatchSize", 25)), "number", "writeBatchSize is a number")
+assert_eq(S.validate("writeBatchSize", 2.7), 2, "writeBatchSize 2.7 floored to 2")
+assert_eq(S.validate("writeBatchSize", "25"), 25, "writeBatchSize '25' coerced to 25")
+assert_eq(S.validate("writeBatchSize", 0), 0, "writeBatchSize 0 kept (lo bound, default-safe)")
+assert_eq(S.validate("writeBatchSize", -5), 0, "writeBatchSize -5 clamps up to 0")
+assert_eq(S.validate("writeBatchSize", 100000), 100000, "writeBatchSize 100000 kept (hi bound)")
+assert_eq(S.validate("writeBatchSize", 999999), 100000, "writeBatchSize 999999 clamps to 100000")
+assert_eq(S.validate("writeBatchSize", "garbage"), 0, "writeBatchSize garbage -> default 0")
+assert_eq(S.validate("writeBatchSize", 0/0), 0, "writeBatchSize NaN -> default 0")
+assert_eq(S.validate("writeBatchSize", 1/0), 0, "writeBatchSize inf -> default 0")
+
+-- normalizedPrefs surfaces writeBatchSize (read-through, no extra wiring).
+do
+    local np = S.normalizedPrefs(nil)
+    assert_eq(np.writeBatchSize, 0, "normalizedPrefs(nil) writeBatchSize default 0")
+    assert_eq(type(np.writeBatchSize), "number", "normalizedPrefs writeBatchSize is number")
+end
+
 -- the three NEW boolean keys fail-closed through toBool.
 do
     local newBoolKeys = { "clusterBursts", "clusterUseStacks", "showDetectionReport" }
