@@ -117,7 +117,18 @@ M.SCHEMA = {
 -- build(prompt, image, model) -> the Gemini generateContent request body table (see header).
 -- image.b64 is the caller-supplied RAW base64 string (may be nil if the caller has not yet
 -- attached it; the builder never invents/encodes one — inline_data.data stays nil).
+-- DEEP (Files-API) variant: when image.fileUri is a non-empty string the image part becomes a
+-- snake_case file_data part { mime_type, file_uri } (NOT inline_data) — the opaque file URI is
+-- set by 13-03's uploadFile glue; the builder stays pure and never encodes. fileUri wins over b64.
+-- (file_data / file_uri are the snake_case WIRE keys, not camelCase.)
 -- The `model` lives in the URL path (set by the provider), NOT the body, so it is unused here.
+local function imagePart(image)
+    if type(image.fileUri) == 'string' and image.fileUri ~= '' then
+        return { file_data = { mime_type = 'image/jpeg', file_uri = image.fileUri } }
+    end
+    return { inline_data = { mime_type = 'image/jpeg', data = image.b64 } }
+end
+
 function M.build(prompt, image, model)
     image = image or {}
     return {
@@ -125,12 +136,7 @@ function M.build(prompt, image, model)
             {
                 parts = {
                     { text = prompt },
-                    {
-                        inline_data = {
-                            mime_type = 'image/jpeg',
-                            data = image.b64,
-                        },
-                    },
+                    imagePart(image),
                 },
             },
         },
