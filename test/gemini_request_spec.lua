@@ -137,3 +137,54 @@ do
     assert_true(dataPart ~= nil, "inline_data part still present without b64")
     assert_eq(dataPart.inline_data.data, nil, "inline_data.data is nil when image.b64 is absent")
 end
+
+-- helper: find the inline_data part and the file_data part (either may be nil).
+local function partsOf(body)
+    local inlinePart, filePart
+    for i = 1, #body.contents[1].parts do
+        local p = body.contents[1].parts[i]
+        if p.inline_data ~= nil then inlinePart = p end
+        if p.file_data ~= nil then filePart = p end
+    end
+    return inlinePart, filePart
+end
+
+-- =====================================================================
+-- (4) DEEP path: image.fileUri set -> file_data.file_uri part; NO inline_data
+--     (13-RESEARCH Gemini Files-API part shape: file_data.mime_type + file_uri).
+-- =====================================================================
+do
+    local FILE_URI = 'https://generativelanguage.googleapis.com/v1beta/files/abc-123'
+    local body = request.build(GEMINI_PROMPT, { kind = 'bytes', fileUri = FILE_URI }, MODEL)
+    local inlinePart, filePart = partsOf(body)
+    assert_true(filePart ~= nil, "file_data part present on the file_uri (deep) path")
+    assert_true(inlinePart == nil, "NO inline_data part on the deep path")
+    assert_eq(filePart.file_data.mime_type, 'image/jpeg', "file_data.mime_type == 'image/jpeg'")
+    assert_eq(filePart.file_data.file_uri, FILE_URI, "file_data.file_uri == image.fileUri")
+    -- the deep part must NOT leak inline base64 data.
+    assert_true(filePart.file_data.data == nil, "file_data part has NO data (no base64 leak)")
+end
+
+-- =====================================================================
+-- (5) CHEAP path stays byte-identical when only b64 is set (no fileUri).
+-- =====================================================================
+do
+    local body = request.build(GEMINI_PROMPT, IMAGE, MODEL)
+    local inlinePart, filePart = partsOf(body)
+    assert_true(inlinePart ~= nil, "cheap path keeps the inline_data part")
+    assert_true(filePart == nil, "cheap path has NO file_data part")
+    assert_eq(inlinePart.inline_data.mime_type, 'image/jpeg', "cheap path keeps mime_type")
+    assert_eq(inlinePart.inline_data.data, B64, "cheap path keeps inline_data.data == image.b64")
+end
+
+-- =====================================================================
+-- (6) PRECEDENCE: fileUri wins when BOTH fileUri and b64 are present.
+-- =====================================================================
+do
+    local FILE_URI = 'https://generativelanguage.googleapis.com/v1beta/files/deep-wins'
+    local body = request.build(GEMINI_PROMPT, { kind = 'bytes', fileUri = FILE_URI, b64 = B64 }, MODEL)
+    local inlinePart, filePart = partsOf(body)
+    assert_true(filePart ~= nil, "fileUri takes precedence: file_data part present")
+    assert_true(inlinePart == nil, "no inline_data part when fileUri wins")
+    assert_eq(filePart.file_data.file_uri, FILE_URI, "file_data.file_uri is the fileUri")
+end
