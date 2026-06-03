@@ -13,10 +13,13 @@
 --   { model = <model>,                        -- passed THROUGH unvalidated (Pitfall 6)
 --     messages = { { role='user', content = {
 --       { type='text',      text=<prompt> },
---       { type='image_url', image_url={ url=<image.dataUrl> } } } } },
+--       { type='image_url', image_url={ url=<image.dataUrl>[, detail=<image.detail>] } } } } },
 --     response_format = { type='json_schema',
 --       json_schema = { name='bird_identification', strict=true, schema=M.SCHEMA } } }
--- detail is OMITTED for v1 (API default — locked decision; a cost/quality lever for later).
+-- detail is a CALLER-SUPPLIED cost/quality lever (D-01-OPENAI): OMITTED when image.detail is
+-- nil/empty so the cheap (preview) pass body is byte-unchanged (API default); the deep loop
+-- (13-04) sets image.detail='high' to request high-detail tiling on the ~2048px deep frame.
+-- The builder NEVER invents a detail value — it only passes through a non-empty image.detail.
 --
 -- M.SCHEMA is the strict translation of contract.lua's CTR-02 response, kept in the
 -- STRICT-SUPPORTED SUBSET ONLY [CODEX MUST-FIX 1]: the ONLY schema keywords anywhere are
@@ -115,6 +118,17 @@ M.SCHEMA = {
 -- build(prompt, image, model) -> Chat Completions request body table (see header).
 -- image.dataUrl is the caller-supplied "data:image/jpeg;base64,..." string (may be nil if the
 -- caller has not yet attached it; the builder never invents/encodes one).
+-- imageUrl(image): { url } on the cheap path; { url, detail } when image.detail is a non-empty
+-- string (deep high-detail tiling, D-01-OPENAI). The detail key is OMITTED otherwise so the cheap
+-- pass body is byte-identical to v1. The builder passes image.detail through verbatim — never
+-- inventing a value (the deep loop alone supplies 'high').
+local function imageUrl(image)
+    if type(image.detail) == 'string' and image.detail ~= '' then
+        return { url = image.dataUrl, detail = image.detail }
+    end
+    return { url = image.dataUrl }
+end
+
 function M.build(prompt, image, model)
     image = image or {}
     return {
@@ -124,7 +138,7 @@ function M.build(prompt, image, model)
                 role = 'user',
                 content = {
                     { type = 'text', text = prompt },
-                    { type = 'image_url', image_url = { url = image.dataUrl } },
+                    { type = 'image_url', image_url = imageUrl(image) },
                 },
             },
         },
