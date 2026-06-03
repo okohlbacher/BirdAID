@@ -37,10 +37,16 @@ local LrStringUtils = import 'LrStringUtils'
 local LrPasswords   = import 'LrPasswords'
 local LrTasks       = import 'LrTasks'
 
+-- LrPathUtils is used only to compute the multipart fileName leaf (DEEP-03 uploadFile). Import it
+-- defensively so a stock-lua module-load (offline) does not hard-fail; uploadFile guards on nil.
+local LrPathUtils
+pcall(function() LrPathUtils = import 'LrPathUtils' end)
+
 local settings = require 'src.settings'
 local keystore = require 'src.lr.keystore'         -- slot-aware Keychain glue (the failover seam)
 local log      = require 'src.log'                 -- single redacting sink (for transport diagnostics)
 local redact   = require('src.redact').redact      -- backstop redaction of any raised message
+local json     = require 'src.json'                -- non-raising decode of the UNTRUSTED Files-API body
 
 local M = {}
 
@@ -252,6 +258,247 @@ end
 -- absent this is BYTE-COMPATIBLE with the legacy path. Either way a nil key / locked keychain /
 -- absent token yields a SPEAKING, token-free error (nil, err) and NEVER an env-var fallback. The
 -- token value NEVER enters a log line or an error string here.
+-- ---------------------------------------------------------------------------
+-- ---------------------------------------------------------------------------
+-- DEEP-03 (Plan 13-03) — Files-API upload/delete glue (D-01a / D-01b)
+--
+-- The deep pass exports a true-full-res JPEG to a temp file (src/lr/fullres_export.lua) and must
+-- get its bytes to the provider WITHOUT base64-ing a full frame on the main thread (D-01a). The
+-- transport is LrHttp.postMultipart STREAMING the file BY PATH — never encodeBase64 of a full
+-- frame. uploadFile returns the provider's Files-API handle (Anthropic file_id / Gemini file_uri),
+-- which the PURE per-provider request builder (13-02) turns into the image source.
+--
+-- D-01b (privacy): the provider-side copy is a copy of the user's photo in a third-party store.
+-- deleteFile issues the Anthropic DELETE /v1/files/{id} so it does not linger; the 13-04 loop calls
+-- it in a guaranteed-teardown branch (success AND error). Gemini auto-expires in 48h -> no-op.
+--
+-- YIELD DISCIPLINE (Pitfall 4): postMultipart and the DELETE both YIELD on the network. We call
+-- the SDK fn DIRECTLY (no surrounding STANDARD pcall — Lua 5.1 forbids yielding across a C-frame).
+-- The caller isolates with deps.pcall = LrTasks.pcall (yield-safe), mirroring makeHttpPost. Tests
+-- inject a fake (non-yielding) deps.postMultipart/deps.deleteRaw so offline runs need no LrHttp.
+--
+-- NO-LEAK (lines 29-31): NEVER log the filePath, the token, the request body, the headers, or the
+-- returned handle VALUE (a file_id/file_uri is provider state we keep out of logs). Log runId +
+-- provider + a boolean outcome only.
+
+-- The Anthropic Files API requires a beta opt-in header (a CONSTANT, not a secret).
+local ANTHROPIC_FILES_BETA = 'files-api-2025-04-14'
+
+-- filesUploadUrl(provider) -> the per-provider Files-API upload endpoint | nil (no upload target).
+-- OpenAI is intentionally absent (D-01-OPENAI): chat-completions has no file slot; it sends the
+-- 2048-equiv frame inline the existing way, so it is never an uploadFile target.
+local function filesUploadUrl(provider)
+    if provider == 'claude' then
+        return 'https://api.anthropic.com/v1/files'
+    elseif provider == 'gemini' then
+        return 'https://generativelanguage.googleapis.com/upload/v1beta/files'
+    end
+    return nil
+end
+
+-- filesHeaders(provider, token) -> the auth-header array EXTENDED with the provider's Files-API
+-- headers. Reuses M.authHeaders (the one place the token VALUE materializes); for Anthropic it
+-- ADDS the constant anthropic-beta opt-in (authHeaders already supplies anthropic-version). The
+-- returned array carries the token value -> NEVER log it.
+local function filesHeaders(provider, token)
+    local headers = M.authHeaders(provider, token)
+    if headers == nil then
+        return nil
+    end
+    if provider == 'claude' then
+        headers[#headers + 1] = { field = 'anthropic-beta', value = ANTHROPIC_FILES_BETA }
+    end
+    return headers
+end
+
+-- ---------------------------------------------------------------------------
+-- uploadFile(provider, filePath, deps) -> handle | (nil, reason)
+--   handle = { fileId = '<id>' }   (Anthropic)  |  { fileUri = '<uri>' }   (Gemini)
+--   reason = 'unsupported-provider' | 'bad-args' | 'no-token' | 'transport' | 'http-<status>'
+--          | 'bad-response'
+--
+-- Streams the temp file BY PATH via LrHttp.postMultipart (NO full-frame encodeBase64 — D-01a) to
+-- the provider's Files API, then parses the returned handle. deps carries:
+--   deps.token        -- the Keychain token (buildDeps); flows ONLY into the auth header value.
+--   deps.pcall        -- LrTasks.pcall (yield-safe). The caller MUST supply it; we fall back to the
+--                        standard pcall ONLY for tests (whose fake postMultipart does not yield).
+--   deps.postMultipart-- optional test seam: function(url, chunks, headers) -> (body, respHeaders).
+--                        Absent at runtime -> LrHttp.postMultipart (which yields; isolated by pcall).
+--   deps.log          -- optional sink override (defaults to the module log). Token/path-free fields.
+-- The token value, the filePath, the body, and the headers NEVER enter a log line.
+-- ---------------------------------------------------------------------------
+function M.uploadFile(provider, filePath, deps)
+    deps = deps or {}
+    local sink   = deps.log or log
+    local runId  = deps.runId
+    local pc     = deps.pcall or pcall   -- runtime: LrTasks.pcall via deps; tests: standard pcall.
+
+    local url = filesUploadUrl(provider)
+    if url == nil then
+        return nil, 'unsupported-provider'
+    end
+    if type(filePath) ~= 'string' or filePath == '' then
+        return nil, 'bad-args'
+    end
+    if type(deps.token) ~= 'string' or deps.token == '' then
+        -- A speaking, token-free failure: the caller surfaces it and skips this photo.
+        pcall(function()
+            sink.warn('deep upload skipped: no token', { runId = runId, provider = provider })
+        end)
+        return nil, 'no-token'
+    end
+
+    local headers = filesHeaders(provider, deps.token)
+    if headers == nil then
+        return nil, 'unsupported-provider'
+    end
+
+    -- The multipart chunk streams the file from disk by filePath (no base64). fileName is the leaf
+    -- basename; if LrPathUtils is unavailable (offline) fall back to a constant — the leaf is NOT
+    -- logged either way.
+    local leaf = 'export.jpg'
+    pcall(function()
+        if LrPathUtils and LrPathUtils.leafName then
+            leaf = LrPathUtils.leafName(filePath) or leaf
+        end
+    end)
+    local chunks = {
+        { name = 'file', fileName = leaf, filePath = filePath, contentType = 'image/jpeg' },
+    }
+
+    -- The SDK call YIELDS on the network -> call it DIRECTLY, isolate with deps.pcall (yield-safe).
+    local doPost = deps.postMultipart or function(u, c, h)
+        return LrHttp.postMultipart(u, c, h)
+    end
+    local okCall, body, respHeaders = pc(function()
+        return doPost(url, chunks, headers)
+    end)
+    if not okCall then
+        pcall(function()
+            sink.warn('deep upload transport failure', { runId = runId, provider = provider })
+        end)
+        return nil, 'transport'
+    end
+    if body == nil then
+        -- LrHttp.postMultipart transport failure: nil body. respHeaders carries network diagnostics
+        -- (NOT the token); we do not log them verbatim here (provider/runId only).
+        pcall(function()
+            sink.warn('deep upload no body', { runId = runId, provider = provider })
+        end)
+        return nil, 'transport'
+    end
+
+    -- A non-2xx status is a Files-API rejection. Status lives on respHeaders.status.
+    local status = (type(respHeaders) == 'table') and respHeaders.status or nil
+    if type(status) == 'number' and (status < 200 or status >= 300) then
+        pcall(function()
+            sink.warn('deep upload http error', {
+                runId = runId, provider = provider, status = tostring(status),
+            })
+        end)
+        return nil, 'http-' .. tostring(status)
+    end
+
+    -- Parse the UNTRUSTED JSON body for the provider handle. json.decode never raises (tuple idiom).
+    local ok, parsed = json.decode(body)
+    if not ok or type(parsed) ~= 'table' then
+        return nil, 'bad-response'
+    end
+    if provider == 'claude' then
+        local id = parsed.id
+        if type(id) == 'string' and id ~= '' then
+            pcall(function()
+                sink.info('deep upload ok', { runId = runId, provider = provider, uploaded = true })
+            end)
+            return { fileId = id }
+        end
+        return nil, 'bad-response'
+    elseif provider == 'gemini' then
+        -- Gemini returns { file = { uri = '...' } }.
+        local uri = (type(parsed.file) == 'table') and parsed.file.uri or nil
+        if type(uri) == 'string' and uri ~= '' then
+            pcall(function()
+                sink.info('deep upload ok', { runId = runId, provider = provider, uploaded = true })
+            end)
+            return { fileUri = uri }
+        end
+        return nil, 'bad-response'
+    end
+    return nil, 'unsupported-provider'
+end
+
+-- ---------------------------------------------------------------------------
+-- deleteFile(provider, handle, deps) -> true | (nil, reason)   (D-01b privacy teardown)
+--   handle = { fileId = '<id>' }   (Anthropic)  |  anything (Gemini no-op)
+--   reason = 'bad-args' | 'no-token' | 'transport' | 'http-<status>'
+--
+-- For Anthropic: DELETE https://api.anthropic.com/v1/files/{id} with the same auth + beta headers
+-- so the provider-side photo copy does not linger (the 13-04 loop calls this on success AND error).
+-- For Gemini: a NO-OP (the Files copy auto-expires in 48h, D-01b) -> returns true.
+-- deps.deleteRaw is a test seam: function(url, headers) -> (body, respHeaders); absent at runtime
+-- -> LrHttp.post(url, '', headers, 'DELETE') (yields; isolated by deps.pcall). The {id} is provider
+-- state; it is interpolated into the URL but NEVER logged.
+-- ---------------------------------------------------------------------------
+function M.deleteFile(provider, handle, deps)
+    deps = deps or {}
+    local sink  = deps.log or log
+    local runId = deps.runId
+    local pc    = deps.pcall or pcall
+
+    if provider == 'gemini' then
+        return true                         -- Gemini Files auto-expire (48h); nothing to delete.
+    end
+    if provider ~= 'claude' then
+        return nil, 'bad-args'              -- OpenAI never uploads; no other provider to clean.
+    end
+
+    local fileId = (type(handle) == 'table') and handle.fileId or nil
+    if type(fileId) ~= 'string' or fileId == '' then
+        return nil, 'bad-args'
+    end
+    if type(deps.token) ~= 'string' or deps.token == '' then
+        return nil, 'no-token'
+    end
+
+    local headers = filesHeaders('claude', deps.token)
+    if headers == nil then
+        return nil, 'bad-args'
+    end
+
+    -- The id is provider state, NOT a secret/path — it goes into the URL but is NEVER logged.
+    local url = 'https://api.anthropic.com/v1/files/' .. fileId
+
+    -- LrHttp.post with an explicit DELETE method (yields on the network -> call directly, isolate
+    -- with deps.pcall). An empty body is correct for a DELETE.
+    local doDelete = deps.deleteRaw or function(u, h)
+        return LrHttp.post(u, '', h, 'DELETE')
+    end
+    local okCall, body, respHeaders = pc(function()
+        return doDelete(url, headers)
+    end)
+    if not okCall then
+        pcall(function()
+            sink.warn('deep delete transport failure', { runId = runId, provider = provider })
+        end)
+        return nil, 'transport'
+    end
+
+    local status = (type(respHeaders) == 'table') and respHeaders.status or nil
+    if type(status) == 'number' and (status < 200 or status >= 300) then
+        pcall(function()
+            sink.warn('deep delete http error', {
+                runId = runId, provider = provider, status = tostring(status),
+            })
+        end)
+        return nil, 'http-' .. tostring(status)
+    end
+
+    pcall(function()
+        sink.info('deep delete ok', { runId = runId, provider = provider, deleted = true })
+    end)
+    return true
+end
+
 -- ---------------------------------------------------------------------------
 function M.buildDeps(provider, prefs, opts)
     local typed = settings.normalizedPrefs(prefs)
