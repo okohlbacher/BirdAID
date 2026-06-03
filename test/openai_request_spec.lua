@@ -154,6 +154,30 @@ do
 end
 
 -- --------------------------------------------------------------------------
+-- DEEP path (D-01-OPENAI): image.detail='high' -> image_url carries detail='high'
+-- (high-detail tiling on the deep pass); url still the caller-supplied data URL.
+-- --------------------------------------------------------------------------
+do
+    local dataUrl = "data:image/jpeg;base64,REEPHIGH"
+    local body = req.build("p", { dataUrl = dataUrl, detail = 'high' }, "m")
+    local imgPart = body.messages[1].content[2]
+    assert_eq(imgPart.type, 'image_url', "deep path still an image_url part")
+    assert_eq(imgPart.image_url.url, dataUrl, "deep path keeps the caller-supplied url")
+    assert_eq(imgPart.image_url.detail, 'high', "deep path passes image.detail through as 'high'")
+end
+
+-- --------------------------------------------------------------------------
+-- image.detail '' (empty string) or nil -> detail key OMITTED (cheap/default;
+-- the existing cheap-path assertion image_url.detail == nil stays green).
+-- --------------------------------------------------------------------------
+do
+    local body = req.build("p", { dataUrl = "data:image/jpeg;base64,QUJD", detail = '' }, "m")
+    local imgPart = body.messages[1].content[2]
+    assert_eq(imgPart.image_url.detail, nil, "empty-string detail is OMITTED (treated as default)")
+    assert_eq(imgPart.image_url.url, "data:image/jpeg;base64,QUJD", "url still passed through")
+end
+
+-- --------------------------------------------------------------------------
 -- SCHEMA: top-level shape
 -- --------------------------------------------------------------------------
 do
