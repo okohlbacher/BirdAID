@@ -591,6 +591,30 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 },
             },
 
+            -- 13-04 (DEEP-03 / D-03): the SEPARATE full-res EXPORT parallelism cap for the
+            -- "Deep identify…" command. It is NOT the AI request concurrency above — concurrent
+            -- full-res exports are the exact risk class v1's preview-timeout cliff guarded, so
+            -- this is its own knob (clamped 1-4, default 2; the spike-tuned escape hatch). Binds
+            -- EXPLICITLY to prefs (bind_to_object = prefs) so it persists; NO secret here.
+            f:row {
+                f:static_text { title = "Deep export parallelism:", width = 180 },
+                f:edit_field {
+                    value = bind { key = 'deepExportConcurrency', bind_to_object = prefs },
+                    width_in_chars = 6,
+                    immediate = false,
+                },
+            },
+            f:row {
+                f:static_text {
+                    title = "Full-res export parallelism for \"Deep identify…\": 1-4, default 2; " ..
+                            "the spike-tuned escape hatch -- separate from AI request concurrency. " ..
+                            "Higher renders more full-res frames at once but risks the export " ..
+                            "timeout cliff; lower it if deep runs stall.",
+                    width_in_chars = 60,
+                    height_in_lines = 3,
+                },
+            },
+
             f:row {
                 f:checkbox {
                     title = "Cluster bursts (identify one anchor per near-duplicate group)",

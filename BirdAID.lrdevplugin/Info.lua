@@ -20,10 +20,23 @@ return {
     LrPluginName        = "BirdAID",
     VERSION             = { major = 1, minor = 0, revision = 0, build = 0 },
 
+    -- NOTE: editing this manifest does NOT hot-reload. After changing LrLibraryMenuItems
+    -- (e.g. adding the deep command), REMOVE + RE-ADD the .lrdevplugin folder in Plug-in
+    -- Manager — a plain Reload will NOT register the new menu item (surfaced in the 13-05
+    -- live-verification checkpoint).
     LrLibraryMenuItems = {
         {
             title       = "Identify Birds in Selected Photos…",
             file        = "IdentifyBirds.lua",
+            enabledWhen = "photosAvailable",
+        },
+        -- D-04: the always-available manual "Deep identify…" command — the full-res evidence
+        -- pass (export -> upload/inline -> identify -> provider-copy cleanup). The SC1
+        -- export-concurrency spike is a pref-guarded path INSIDE DeepIdentify.lua, so there is
+        -- NO dev-harness menu entry here (the recursive dist gate stays clean on Info.lua).
+        {
+            title       = "Deep identify…",
+            file        = "DeepIdentify.lua",
             enabledWhen = "photosAvailable",
         },
     },
