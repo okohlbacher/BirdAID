@@ -127,6 +127,16 @@ M.SCHEMA = {
 -- build(prompt, image, model) -> the Messages-API request body table (see header).
 -- image.b64 is the caller-supplied RAW base64 string (may be nil if the caller has not yet
 -- attached it; the builder never invents/encodes one — source.data stays nil).
+-- DEEP (Files-API) variant: when image.fileId is a non-empty string the image source becomes
+-- { type='file', file_id=image.fileId } (no media_type/data) — the opaque handle is set by
+-- 13-03's uploadFile glue; the builder stays pure and never encodes. fileId wins over b64.
+local function imageSource(image)
+    if type(image.fileId) == 'string' and image.fileId ~= '' then
+        return { type = 'file', file_id = image.fileId }
+    end
+    return { type = 'base64', media_type = 'image/jpeg', data = image.b64 }
+end
+
 function M.build(prompt, image, model)
     image = image or {}
     return {
@@ -148,11 +158,7 @@ function M.build(prompt, image, model)
                     { type = 'text', text = prompt },
                     {
                         type = 'image',
-                        source = {
-                            type = 'base64',
-                            media_type = 'image/jpeg',
-                            data = image.b64,
-                        },
+                        source = imageSource(image),
                     },
                 },
             },
