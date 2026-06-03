@@ -158,6 +158,11 @@ M.DEFAULTS = {
     -- (Phase 9 — Throughput/Cluster/Viz): greenlit v1.0 features, all OFF/serial by default.
     -- BL-06 — parallel AI requests via a cooperative worker pool. THE single throughput knob.
     maxConcurrency      = 1,      -- integer 1..50; DEFAULT 1 = the existing serial code path.
+    -- 13-01 (DEEP-03 / D-03) — SEPARATE full-res export concurrency cap. It MUST NOT reuse
+    -- the AI maxConcurrency (the v1 100%-timeout class came from N concurrent renders, BL-06):
+    -- integer 1..4, DEFAULT 2. The Phase-13 spike tunes the recommended default; the knob is
+    -- the user escape hatch. Distinct key, never an alias of maxConcurrency.
+    deepExportConcurrency = 2,    -- integer 1..4; DEFAULT 2 (mild parallelism, guard-railed).
     -- BL-14 (12-01 WBATCH) — incremental keyword-flush batch size.
     -- 0/absent => single end-of-run write (byte-for-byte today, default-safe per RESEARCH A5);
     -- >=1 => batch flush ~25.
@@ -237,6 +242,10 @@ function M.validate(key, value)
     if key == "previewSize" then return clampNumber(value, 512, 8192, 2048) end
     -- BL-06 maxConcurrency is an INTEGER count 1..50 default 1 (floored, never fractional).
     if key == "maxConcurrency" then return clampInt(value, 1, 50, 1) end
+    -- 13-01 D-03: deepExportConcurrency is the SEPARATE full-res export cap, integer 1..4
+    -- default 2 (clampInt, floored — an export-worker count is never fractional). NOT an
+    -- alias of maxConcurrency; the two caps are independent by design.
+    if key == "deepExportConcurrency" then return clampInt(value, 1, 4, 2) end
     -- 12-01: BL-14 writeBatchSize is an INTEGER batch count 0..100000 default 0 (clampInt, NOT
     -- clampNumber — a batch count is never fractional; 0 = single end-of-run write, default-safe).
     if key == "writeBatchSize" then return clampInt(value, 0, 100000, 0) end
