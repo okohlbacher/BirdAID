@@ -163,3 +163,54 @@ do
     assert_true(imageBlock ~= nil, "image block still present without b64")
     assert_eq(imageBlock.source.data, nil, "source.data is nil when image.b64 is absent")
 end
+
+-- helper to find the single image block in a built body.
+local function imageBlockOf(body)
+    for i = 1, #body.messages[1].content do
+        local b = body.messages[1].content[i]
+        if b.type == 'image' then return b end
+    end
+    return nil
+end
+
+-- =====================================================================
+-- (5) DEEP path: image.fileId set -> source.type='file' + file_id (Files-API);
+--     NO media_type, NO data leak (13-RESEARCH Anthropic Files-API source shape).
+-- =====================================================================
+do
+    local FILE_ID = 'file_011CPMxVD3fHLUhvTqtsQA5w'
+    local body = request.build(PROMPT, { kind = 'bytes', fileId = FILE_ID }, MODEL)
+    local imageBlock = imageBlockOf(body)
+    assert_true(imageBlock ~= nil, "image block present on the file_id (deep) path")
+    assert_eq(imageBlock.type, 'image', "block type stays 'image' on the deep path")
+    assert_true(type(imageBlock.source) == 'table', "image block has a source")
+    assert_eq(imageBlock.source.type, 'file', "source.type == 'file' (Files-API source)")
+    assert_eq(imageBlock.source.file_id, FILE_ID, "source.file_id == image.fileId (opaque handle)")
+    -- the file source carries NEITHER media_type NOR data.
+    assert_eq(imageBlock.source.media_type, nil, "file source has NO media_type")
+    assert_eq(imageBlock.source.data, nil, "file source has NO data (no base64 leak)")
+end
+
+-- =====================================================================
+-- (6) CHEAP path stays byte-identical when only b64 is set (no fileId).
+-- =====================================================================
+do
+    local body = request.build(PROMPT, IMAGE, MODEL)
+    local imageBlock = imageBlockOf(body)
+    assert_eq(imageBlock.source.type, 'base64', "cheap path keeps source.type == 'base64'")
+    assert_eq(imageBlock.source.media_type, 'image/jpeg', "cheap path keeps media_type")
+    assert_eq(imageBlock.source.data, B64, "cheap path keeps source.data == image.b64")
+    assert_eq(imageBlock.source.file_id, nil, "cheap path has NO file_id key")
+end
+
+-- =====================================================================
+-- (7) PRECEDENCE: fileId wins when BOTH fileId and b64 are present (deep path wins).
+-- =====================================================================
+do
+    local FILE_ID = 'file_DEEPWINS'
+    local body = request.build(PROMPT, { kind = 'bytes', fileId = FILE_ID, b64 = B64 }, MODEL)
+    local imageBlock = imageBlockOf(body)
+    assert_eq(imageBlock.source.type, 'file', "fileId takes precedence over b64")
+    assert_eq(imageBlock.source.file_id, FILE_ID, "source.file_id is the fileId")
+    assert_eq(imageBlock.source.data, nil, "no base64 data when fileId wins")
+end
