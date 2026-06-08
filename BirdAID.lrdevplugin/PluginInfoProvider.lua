@@ -5,7 +5,7 @@
 -- top-level SDK-loaded file, so it MAY import Lr* namespaces -- the negative-purity gate
 -- scans src/ only, and this file is NOT under src/. All decision logic it relies on lives
 -- in the Wave-1 PURE src/settings.lua (defaults, catalog, validate, normalizedPrefs,
--- tokenKeyFor, tokenStatus, isValidModel, sanitizePathHint, DISCLOSURE_TEXT); this file is
+-- key-status classification, isValidModel, sanitizePathHint, DISCLOSURE_TEXT); this file is
 -- thin wiring.
 --
 -- Responsibilities:
@@ -14,27 +14,28 @@
 --             bind_to_object = prefs, so values actually persist. A bare `bind 'key'` inside
 --             an InfoProvider binds to the InfoProvider property table (transient), NOT to
 --             prefs -- so non-secret controls MUST use bind_to_object = prefs.
---   * SET-03: route the API token EXCLUSIVELY through LrPasswords (macOS Keychain). The
---             password_field binds to a TRANSIENT propertyTable (NEVER prefs, NEVER a log
---             line). Save is pcall-wrapped; tokenStatus flips to "set" ONLY on a successful
---             store; a failed store shows a non-secret LrDialogs error and never reports
---             success. tokenKeyFor(nil)/unknown provider disables Save.
+--   * SET-03: route API keys EXCLUSIVELY through the Keychain (via src/lr/keystore, which
+--             wraps LrPasswords). Every key entry binds to a TRANSIENT propertyTable (NEVER
+--             prefs, NEVER a log line) and is write-only; the secret is never read back into
+--             a visible field. The canonical credential UI is the per-provider "API keys
+--             (priority order)" list below -- the original single-token field it subsumed was
+--             retired (slot 1 already reuses the legacy <provider>_api_token Keychain id, so
+--             existing single keys are never orphaned).
 --   * SET-04: GPS/date checkbox (default ON) + path-hint checkbox (default OFF) + the
 --             disclosure paragraph (settings.DISCLOSURE_TEXT).
---   * SET-05: the one diagnostic line ("api token saved") goes through src/log.lua and
---             carries the provider only -- the token value is never constructed into a line.
+--   * SET-05: the one diagnostic line ("api key saved") goes through src/log.lua and
+--             carries the provider + non-secret storage ordinal only -- the value is never
+--             constructed into a line.
 --
 -- A provider-change observer (on the PREFS provider key, which is the observable that
 -- actually holds provider) recomputes the model popup, resets an invalid model to the new
--- provider's first model, clears the transient token entry, and recomputes tokenStatus for
--- the new provider's key.
+-- provider's first model, and rebinds/refreshes the per-provider key list.
 --
 -- Strictly Lua 5.1 common subset: no \u{}, no integer //, no goto, no <close>;
 -- UTF-8 must be literal bytes, never escapes.
 
 local LrView      = import 'LrView'
 local LrPrefs     = import 'LrPrefs'
-local LrPasswords = import 'LrPasswords'
 local LrDialogs   = import 'LrDialogs'
 local LrPathUtils = import 'LrPathUtils'
 
@@ -67,8 +68,9 @@ local function ensureDefaults(prefs)
     end
 end
 
--- Derive the human-readable indicator label from a tokenStatus string. NEVER includes the
--- secret value -- only the classification.
+-- Derive the human-readable indicator label from a key-status string ("set" |
+-- "keychain_error" | other => "not set"). NEVER includes the secret value -- only the
+-- classification.
 local function labelForStatus(status)
     if status == "set" then
         return "Token: set"
@@ -77,44 +79,6 @@ local function labelForStatus(status)
     else
         return "Token: not set"
     end
-end
-
--- Defensively classify the stored token for a given Keychain key. tokenKey may be nil
--- (unknown/corrupt provider) -> never build a key from raw prefs; report "absent". When
--- non-nil, wrap LrPasswords.retrieve in pcall (a locked keychain may raise) and classify
--- with the pure settings.tokenStatus -> "set" | "absent" | "keychain_error".
-local function computeTokenStatus(tokenKey)
-    if tokenKey == nil then
-        return "absent"
-    end
-    local ok, val = pcall(function()
-        return LrPasswords.retrieve(tokenKey, nil, PLUGIN_ID)
-    end)
-    return settings.tokenStatus(ok, val)
-end
-
--- Human display name for a provider value (catalog title minus the " (default)" suffix), so the
--- token field can name WHICH provider's key is being set. Falls back to the raw value.
-local function providerDisplay(provider)
-    for _, it in ipairs(settings.providerItems()) do
-        if it.value == provider then
-            return (it.title:gsub("%s*%(default%)%s*$", ""))
-        end
-    end
-    return tostring(provider or "")
-end
-
--- Refresh the transient token UI state on propertyTable for the CURRENT provider:
--- recompute the active key, status, label, and whether Save is enabled (a nil key disables
--- Save). NEVER reads or stores the secret value.
-local function refreshTokenState(propertyTable, prefs)
-    local tokenKey = settings.tokenKeyFor(prefs.provider)
-    local status   = computeTokenStatus(tokenKey)
-    propertyTable.tokenStatus   = status
-    propertyTable.tokenLabel    = labelForStatus(status)
-    propertyTable.saveEnabled   = (tokenKey ~= nil)
-    -- Make the field name WHICH provider's key it sets, so it is obvious the key is per-provider.
-    propertyTable.tokenFieldTitle = "API token (" .. providerDisplay(prefs.provider) .. "):"
 end
 
 -- ---------------------------------------------------------------------------
@@ -188,13 +152,10 @@ local function sectionsForTopOfDialog(f, propertyTable)
     -- keystore.statusForSlot); never touches a Keychain value, never re-runs once keyOrder exists.
     keystore.migrateIfNeeded(prefs.provider, prefs)
 
-    -- Transient (NON-persisted) token entry box: bound to propertyTable, NEVER to prefs.
-    propertyTable.apiTokenEntry = ""
     -- [CODEX MUST-FIX 3] The model popup's items must be REACTIVE to provider changes, so
     -- bind them to this transient property (updated by the observer) rather than computing a
     -- static list once at render. Seed it for the current provider.
     propertyTable.modelItems = settings.modelItemsFor(prefs.provider)
-    refreshTokenState(propertyTable, prefs)
 
     -- Per-POSITION TRANSIENT, WRITE-ONLY secret entries. apiTokenEntry_<p> binds to propertyTable
     -- (NEVER prefs) and NEVER holds the stored secret: a password_field shows nothing on open and
@@ -233,8 +194,6 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 prefs.model = def
             end
         end
-        propertyTable.apiTokenEntry = ""
-        refreshTokenState(propertyTable, prefs)
         -- A provider switch also changes which keyOrder list is live: migrate the new provider's
         -- single key if needed (idempotent), clear all transient per-row entries, observe the new
         -- provider's keyOrder pref, and recompute the per-row list. (Observing the new key is
@@ -478,85 +437,6 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     title = settings.DISCLOSURE_TEXT,
                     width_in_chars = 60,
                     height_in_lines = 4,
-                },
-            },
-
-            -- TOKEN: bound to the TRANSIENT propertyTable (NEVER prefs). The entry is
-            -- write-only; the secret is never read back into a visible field. The label names the
-            -- CURRENT provider (reactive) so it is clear the key is stored PER provider.
-            f:row {
-                f:static_text {
-                    title = bind { key = 'tokenFieldTitle', bind_to_object = propertyTable },
-                    width = 140,
-                },
-                f:password_field {
-                    value = bind { key = 'apiTokenEntry', bind_to_object = propertyTable },
-                    width_in_chars = 40,
-                },
-            },
-
-            f:row {
-                f:static_text {
-                    title = bind { key = 'tokenLabel', bind_to_object = propertyTable },
-                    width_in_chars = 60,
-                },
-            },
-
-            -- Make the per-provider key model discoverable (users expected one global key).
-            f:row {
-                f:static_text {
-                    title = "Each provider keeps its OWN key. To use more than one, switch "
-                        .. "\"Provider\" above, enter that provider's key, and Save again. Keys are "
-                        .. "stored separately in the OS keychain; this field clears on switch (the "
-                        .. "saved key is never shown) — the status line above tells you if the "
-                        .. "selected provider has a key.",
-                    width_in_chars = 60,
-                    height_in_lines = 4,
-                },
-            },
-
-            f:row {
-                f:push_button {
-                    title   = "Save token to Keychain",
-                    enabled = bind { key = 'saveEnabled', bind_to_object = propertyTable },
-                    action  = function()
-                        local entry = propertyTable.apiTokenEntry or ""
-                        if entry == "" then
-                            return
-                        end
-
-                        -- Recompute the key at action time (provider may have changed). A nil
-                        -- key (unknown provider) must NEVER yield an arbitrary Keychain key.
-                        local key = settings.tokenKeyFor(prefs.provider)
-                        if key == nil then
-                            LrDialogs.message(
-                                "Cannot save token",
-                                "Unknown provider -- pick a valid provider first.",
-                                "warning")
-                            return
-                        end
-
-                        -- pcall-wrap the store: a locked keychain may raise. Flip status to
-                        -- "set" ONLY inside the success branch -- never falsely report success.
-                        local ok = pcall(function()
-                            LrPasswords.store(key, entry, nil, PLUGIN_ID)
-                        end)
-
-                        if ok then
-                            propertyTable.apiTokenEntry = ""
-                            propertyTable.tokenStatus = "set"
-                            propertyTable.tokenLabel  = labelForStatus("set")
-                            -- The token VALUE never enters this line; provider is non-secret.
-                            log.info("api token saved", { provider = prefs.provider })
-                        else
-                            -- The error message MUST NOT contain the token value.
-                            LrDialogs.message(
-                                "Could not save token",
-                                "The system keychain rejected the save (it may be locked). " ..
-                                "Try again after unlocking.",
-                                "critical")
-                        end
-                    end,
                 },
             },
         },
