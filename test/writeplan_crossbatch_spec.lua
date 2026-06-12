@@ -119,6 +119,33 @@ do
 end
 
 -- =====================================================================
+-- (1b) D4 / M1 — NO CALLER MUTATION: after a cross-batch fold, the caller's ORIGINAL record and its
+--      existingNames table are untouched (flushAll hands writeplan a shallow clone, never reassigns
+--      rec.existingNames in place). The record identity and its existingNames identity/contents must
+--      be exactly as the caller supplied them.
+-- =====================================================================
+do
+    local rec1 = recFor("p1")
+    local rec2 = recFor("p1")            -- SAME photoKey ⇒ batch 2 would fold batch 1's name
+    local origExisting2 = rec2.existingNames
+    local results = { rec1, rec2 }
+    local spy = makeSpy({ 'executed', 'executed' })
+    local prefs = { writeBatchSize = 1, confidenceThreshold = 0.6 }
+
+    batcher.flushAll(results, prefs, spy.fn)
+
+    -- The caller's record table identities are preserved (not swapped out).
+    assert_true(results[2] == rec2, "caller's record-2 identity is preserved")
+    -- existingNames table identity is unchanged (NOT reassigned to the merged clone in place).
+    assert_true(rec2.existingNames == origExisting2,
+        "caller's record-2 existingNames table identity is unchanged (no in-place reassign)")
+    -- And its CONTENTS were not folded into (the merged cardinal name lives only on the clone).
+    assert_true(rec2.existingNames[CARDINAL] == nil,
+        "caller's record-2 existingNames was NOT mutated with the folded-forward name")
+    assert_true(next(rec2.existingNames) == nil, "caller's record-2 existingNames stays empty")
+end
+
+-- =====================================================================
 -- (2) CODEX HIGH-1: a NON-committed batch-1 status does NOT fold. Test 'error', 'aborted', 'queued'.
 --     batch 2 STILL contains batch-1's name in each case.
 -- =====================================================================

@@ -78,8 +78,10 @@ end
 -- Slices via M.slice(results, prefs.writeBatchSize) and, for each chunk:
 --   1. merges addedSoFar[photoKey] (names written in PRIOR COMMITTED batches this run) into a
 --      FRESH copy of that record's existingNames BEFORE calling writeplan.planReport (Option A —
---      build() stays UNCHANGED; the merge never mutates the caller's original existingNames table
---      in place, so any later use of the record is uncorrupted);
+--      build() stays UNCHANGED). D4 (M1): the chunk records handed to writeplan are SHALLOW CLONES
+--      of the caller's records (every key copied, then existingNames overridden with the merged
+--      set), so neither the record table NOR its existingNames table is mutated in place — any
+--      later use of the caller's original records is uncorrupted;
 --   2. calls applyFn ONCE per chunk and captures the RETURNED status string;
 --   3. folds report.plan.entries[*].addKeywords forward into addedSoFar[photoKey] ONLY when the
 --      status is a committed-success AND the flush is not a dry-run.
@@ -94,9 +96,13 @@ function M.flushAll(results, prefs, applyFn)
     local applyCount = 0
 
     for _, chunk in ipairs(M.slice(results, batchSize)) do
-        -- (1) Pre-merge prior-committed names into a FRESH existingNames per record (no in-place
-        --     mutation of the caller's table). Only touch records that have a prior set.
-        for _, rec in ipairs(chunk) do
+        -- (1) Build a FRESH per-chunk record list. When a record has prior-committed names, hand
+        --     writeplan a SHALLOW CLONE of the record (every key copied) whose existingNames is the
+        --     merged set — never assigning back onto the caller's record (D4 / M1: the header used
+        --     to claim no mutation while reassigning rec.existingNames in place). Records with no
+        --     prior set are passed through unchanged (read-only by writeplan, so safe to reuse).
+        local planChunk = {}
+        for ci, rec in ipairs(chunk) do
             local prior = addedSoFar[rec.photoKey]
             if prior then
                 local merged = {}
@@ -104,12 +110,17 @@ function M.flushAll(results, prefs, applyFn)
                     for k in pairs(rec.existingNames) do merged[k] = true end
                 end
                 for k in pairs(prior) do merged[k] = true end
-                rec.existingNames = merged
+                local clone = {}
+                for k, v in pairs(rec) do clone[k] = v end
+                clone.existingNames = merged
+                planChunk[ci] = clone
+            else
+                planChunk[ci] = rec
             end
         end
 
         -- (2) UNCHANGED builder + the single injected side-effecting apply per chunk.
-        local report = writeplan.planReport(chunk, prefs)
+        local report = writeplan.planReport(planChunk, prefs)
         local status = applyFn(report.plan, report)
         applyCount = applyCount + 1
         statuses[#statuses + 1] = status
