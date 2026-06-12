@@ -89,45 +89,20 @@ local keyring        = require 'src.net.keyring'        -- PURE per-slot health/
 local keyringRunner  = require 'src.net.keyring_runner'  -- PURE failover coordinator (DKEY-02)
 local backoff        = require 'src.net.backoff'         -- PURE single-key per-attempt sleep fallback
 
--- Per-invocation monotonic counter so even two newRunId() calls within the SAME fractional
--- instant (or with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives
--- across calls within a single plugin load.
-local runIdCounter = 0
+-- D8 (H4): newRunId, cancelled, and photoName were byte-identical in both entry points; they now
+-- live in shared modules (src.run_id pure; src.lr.entry_support glue). newRunId takes the fractional
+-- LrDate clock as an injected closure (keeps run_id pure); photoName takes the metadata reader.
+local runId_      = require 'src.run_id'
+local entrySupport = require 'src.lr.entry_support'
 
--- newRunId() -> a UNIQUE, sanitize-safe run id. os.time() alone shares a temp dir across
--- same-second runs, so we combine three sources, joined with '-' (ONLY [%w-_] chars so
--- sweep.sanitizeRunId accepts it; NO '.' which sanitizeRunId rejects):
---   * os.time()              -- Unix wall-clock seconds (coarse).
---   * LrDate.currentTime()   -- fractional seconds; the decimal point is stripped to keep the
---                               id sanitize-safe, so two runs in the same second still differ.
---   * runIdCounter           -- a monotonic per-load counter as a final disambiguator.
 local function newRunId()
-    local okT, t = pcall(os.time)
-    local secs = okT and t or 0
-
-    local frac = "0"
-    local okF, f = pcall(function() return LrDate.currentTime() end)
-    if okF and type(f) == 'number' and f == f then
-        local s = string.format("%.4f", f)
-        frac = (s:gsub("[^%d]", ""))
-        if frac == "" then frac = "0" end
-    end
-
-    runIdCounter = runIdCounter + 1
-
-    return tostring(secs) .. "-" .. frac .. "-" .. tostring(runIdCounter)
+    return runId_.newRunId(function() return LrDate.currentTime() end)
 end
-
--- cancelled(progress) -> bool, guarded so a missing/throwing isCanceled never crashes the run.
 local function cancelled(progress)
-    local ok, c = pcall(function() return progress:isCanceled() end)
-    return (ok and c) or false
+    return entrySupport.cancelled(progress)
 end
-
--- Best-effort formatted file name for human-readable context. Never raises, never PII-leaks.
 local function photoName(photo)
-    local ok, name = pcall(function() return metadataReader.formattedFileName(photo) end)
-    return (ok and name) or "(unknown file)"
+    return entrySupport.photoName(photo, metadataReader)
 end
 
 LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(context)
@@ -730,33 +705,21 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             runId = runId, photoCount = #entries, totalKeywordsToAdd = totalAdds, dryRun = true,
         })
     else
-        -- BATCHED FLUSH (WBATCH-01/02): route the write through batcher.flushAll. At
-        -- writeBatchSize=0 (default) slice yields exactly ONE chunk == today's single apply
-        -- (default-safe, spy-asserted). The applyFn closure reproduces the EXACT shipped
-        -- catalogWriter.apply 5-arg signature per chunk and RETURNS its status string so flushAll
-        -- gates the cross-batch fold on a committed success (CODEX HIGH-1/HIGH-2). flushAll's own
-        -- body (slicing, cumulative diff) runs OUTSIDE any catalog write gate; the ONLY thing that
-        -- enters the encapsulated catalog_writer gate is catalogWriter.apply inside this closure
+        -- BATCHED FLUSH (WBATCH-01/02): route the write through the shared entry_support.flushWrite
+        -- (D8) — batcher.flushAll + the per-chunk applyFn (catalogWriter.apply, runId-stamped) + the
+        -- status fold. At writeBatchSize=0 (default) slice yields ONE chunk == today's single apply.
+        -- The ONLY thing entering the encapsulated catalog_writer gate is catalogWriter.apply
         -- (CLAUDE.md HARD CONSTRAINT — no gallery/flush logic is nested in the gate).
-        local function applyFn(plan, _chunkReport)
-            return catalogWriter.apply(
-                catalog,
-                plan,
-                "BirdAID: write bird keywords",
-                { runId = runId },
-                { pcall = LrTasks.pcall }   -- yield-safe outer gate wrap (the gate yields internally)
-            )
-        end
-        local flush = batcher.flushAll(results, prefs, applyFn)
-        -- Authoritative writeResult for the summary: 'error' if ANY chunk errored, else the last
-        -- committed status (executed/noop). A single-chunk run is byte-identical to today.
-        writeResult = 'noop'
-        local statuses = (type(flush) == 'table' and type(flush.statuses) == 'table') and flush.statuses or {}
-        for si = 1, #statuses do
-            local s = statuses[si]
-            if s == 'error' then writeResult = 'error'; break end
-            writeResult = s
-        end
+        writeResult = entrySupport.flushWrite({
+            catalogWriter = catalogWriter,
+            catalog       = catalog,
+            batcher       = batcher,
+            results       = results,
+            prefs         = prefs,
+            runId         = runId,
+            actionName    = "BirdAID: write bird keywords",
+            pcall         = LrTasks.pcall,
+        })
     end
 
     -- ---- RETRY-01: persist the per-photo TERMINAL/RETRYABLE run-state (cross-session) ----------

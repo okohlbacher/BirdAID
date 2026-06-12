@@ -109,40 +109,21 @@ local keyring        = require 'src.net.keyring'        -- PURE per-slot health/
 local keyringRunner  = require 'src.net.keyring_runner'  -- PURE failover coordinator (DKEY-02)
 local backoff        = require 'src.net.backoff'         -- PURE single-key per-attempt sleep fallback
 
--- Per-invocation monotonic counter so two newRunId() calls within the SAME fractional instant (or
--- with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives across calls.
-local runIdCounter = 0
+-- D8 (H4): newRunId, cancelled, and photoName used to be duplicated byte-for-byte from
+-- IdentifyBirds.lua; they now live in shared modules (src.run_id pure; src.lr.entry_support glue).
+-- newRunId takes the fractional LrDate clock as an injected closure (keeps run_id pure); photoName
+-- takes the metadata reader.
+local runId_       = require 'src.run_id'
+local entrySupport = require 'src.lr.entry_support'
 
--- newRunId() -> a UNIQUE, sanitize-safe run id (ONLY [%w-_] chars so sweep.sanitizeRunId accepts
--- it; NO '.'). Copied verbatim from IdentifyBirds.lua: os.time() + fractional LrDate + a per-load
--- counter, joined with '-'.
 local function newRunId()
-    local okT, t = pcall(os.time)
-    local secs = okT and t or 0
-
-    local frac = "0"
-    local okF, f = pcall(function() return LrDate.currentTime() end)
-    if okF and type(f) == 'number' and f == f then
-        local s = string.format("%.4f", f)
-        frac = (s:gsub("[^%d]", ""))
-        if frac == "" then frac = "0" end
-    end
-
-    runIdCounter = runIdCounter + 1
-
-    return tostring(secs) .. "-" .. frac .. "-" .. tostring(runIdCounter)
+    return runId_.newRunId(function() return LrDate.currentTime() end)
 end
-
--- cancelled(progress) -> bool, guarded so a missing/throwing isCanceled never crashes the run.
 local function cancelled(progress)
-    local ok, c = pcall(function() return progress:isCanceled() end)
-    return (ok and c) or false
+    return entrySupport.cancelled(progress)
 end
-
--- Best-effort formatted file name for human-readable context. Never raises, never PII-leaks.
 local function photoName(photo)
-    local ok, name = pcall(function() return metadataReader.formattedFileName(photo) end)
-    return (ok and name) or "(unknown file)"
+    return entrySupport.photoName(photo, metadataReader)
 end
 
 -- The SHARED scratch root <temp>/BirdAID/. Every run owns a run-<id>/ subdir under it; the reaper
@@ -736,25 +717,19 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         })
     else
         -- SINGLE batched write of RESULTS ONLY — NO export/upload/network inside the gate (Pitfall 2).
-        -- The batcher slices at writeBatchSize (default 0 == one chunk == today's single apply); the
-        -- ONLY thing entering the encapsulated catalog_writer gate is catalogWriter.apply.
-        local function applyFn(plan, _chunkReport)
-            return catalogWriter.apply(
-                catalog,
-                plan,
-                "BirdAID: write bird keywords (deep)",
-                { runId = runId },
-                { pcall = LrTasks.pcall }
-            )
-        end
-        local flush = batcher.flushAll(results, prefs, applyFn)
-        writeResult = 'noop'
-        local statuses = (type(flush) == 'table' and type(flush.statuses) == 'table') and flush.statuses or {}
-        for si = 1, #statuses do
-            local s = statuses[si]
-            if s == 'error' then writeResult = 'error'; break end
-            writeResult = s
-        end
+        -- Routed through the shared entry_support.flushWrite (D8); the ONLY per-entry difference is the
+        -- " (deep)" Undo actionName. The batcher slices at writeBatchSize (default 0 == one chunk);
+        -- the ONLY thing entering the encapsulated catalog_writer gate is catalogWriter.apply.
+        writeResult = entrySupport.flushWrite({
+            catalogWriter = catalogWriter,
+            catalog       = catalog,
+            batcher       = batcher,
+            results       = results,
+            prefs         = prefs,
+            runId         = runId,
+            actionName    = "BirdAID: write bird keywords (deep)",
+            pcall         = LrTasks.pcall,
+        })
     end
 
     -- ---- RETRY-01: persist the per-photo TERMINAL/RETRYABLE run-state (cross-session) -------------
