@@ -143,6 +143,20 @@ local function refreshKeyList(propertyTable, prefs)
     propertyTable.keyCountLabel = "Keys for this provider: " .. tostring(n) .. " of " .. tostring(MAX_KEYS)
 end
 
+-- M3: clear ALL transient per-POSITION key-entry fields. ANY structural change to keyOrder
+-- (Remove compacts the list; Up/Down swap positions; a provider switch swaps the whole list)
+-- shifts which storage ordinal a position maps to. Unsaved typed text in a password_field is
+-- bound to apiTokenEntry_<position>, NOT to a storage ordinal, so after a shift that text would
+-- "stick" to the wrong position and a later Save would write it to the wrong Keychain slot.
+-- Clearing every entry on every restructure makes that impossible. (The fields are write-only
+-- transients -- clearing them never touches a stored secret; the Keychain is keyed by the
+-- STABLE storage ordinal, untouched here.)
+local function clearKeyEntries(propertyTable)
+    for p = 1, MAX_KEYS do
+        propertyTable['apiTokenEntry_' .. p] = ""
+    end
+end
+
 local function sectionsForTopOfDialog(f, propertyTable)
     local prefs = LrPrefs.prefsForPlugin()
     ensureDefaults(prefs)
@@ -162,9 +176,7 @@ local function sectionsForTopOfDialog(f, propertyTable)
     -- is cleared after Save, so rebinding a position to a different storage ordinal across
     -- reorder/remove can NEVER orphan or leak the stored secret -- the secret lives ONLY in the
     -- Keychain keyed by the STABLE storage ordinal keyOrder[p] (round-2 BLOCKER-A discipline).
-    for p = 1, MAX_KEYS do
-        propertyTable['apiTokenEntry_' .. p] = ""
-    end
+    clearKeyEntries(propertyTable)
     refreshKeyList(propertyTable, prefs)
 
     -- Observe the keyOrder list for the CURRENT provider so add/remove/reorder reactively recompute
@@ -200,9 +212,7 @@ local function sectionsForTopOfDialog(f, propertyTable)
         -- additive -- an extra no-op observer on the prior provider's key is harmless since that
         -- list is no longer displayed; refreshKeyList always reads prefs.provider's current order.)
         keystore.migrateIfNeeded(prefs.provider, prefs)
-        for p = 1, MAX_KEYS do
-            propertyTable['apiTokenEntry_' .. p] = ""
-        end
+        clearKeyEntries(propertyTable)
         prefs:addObserver('keyOrder_' .. tostring(prefs.provider), function()
             refreshKeyList(propertyTable, prefs)
         end)
@@ -287,6 +297,9 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     if pos > 1 and order[pos] ~= nil then
                         order[pos], order[pos - 1] = order[pos - 1], order[pos]
                         setKeyOrder(prefs, prefs.provider, order)
+                        -- M3: a swap shifts which ordinal each position maps to; drop ALL
+                        -- unsaved typed text so it can never be Saved to the wrong slot.
+                        clearKeyEntries(propertyTable)
                     end
                 end,
             },
@@ -298,6 +311,8 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     if order[pos] ~= nil and order[pos + 1] ~= nil then
                         order[pos], order[pos + 1] = order[pos + 1], order[pos]
                         setKeyOrder(prefs, prefs.provider, order)
+                        -- M3: see Up -- clear all transient entries after a position swap.
+                        clearKeyEntries(propertyTable)
                     end
                 end,
             },
@@ -317,8 +332,11 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     keystore.storeTokenForSlot(prefs.provider, storageIndex, "")
                     table.remove(order, pos)
                     setKeyOrder(prefs, prefs.provider, order)
-                    -- Clear the transient entry on the now-shifted position set.
-                    propertyTable['apiTokenEntry_' .. pos] = ""
+                    -- M3: table.remove COMPACTS the list, so every position at/after `pos`
+                    -- now maps to a different storage ordinal. Clearing only apiTokenEntry_<pos>
+                    -- left unsaved text on the shifted positions stuck to the WRONG ordinal.
+                    -- Clear ALL transient entries instead.
+                    clearKeyEntries(propertyTable)
                     log.info("api key removed", { provider = prefs.provider, storageIndex = storageIndex })
                 end,
             },
