@@ -376,6 +376,37 @@ do
 end
 
 -- =====================================================================
+-- (8b) [CODEX review] DEEP Files-API handle: image carries fileUri (NO b64) -> the guard must NOT
+--      fail-fast; identify reaches the request builder and the posted body carries the file_data
+--      part (file_uri). Proves the deep pass no longer dies with missing-image-b64.
+-- =====================================================================
+do
+    local post, calls = scriptedPost({ { status = 200, body = F.SUCCESS_BODY, headers = F.success.headers } })
+    local deps = makeDeps(post)
+    local prov = gemini.new(deps)
+    local fileImage = { kind = 'fileUri', fileUri = 'https://files/abc', width = 800, height = 600 } -- NO b64
+    local resp, err = prov.identify(fileImage, CTX)
+    assert_true(err == nil, "fileUri: no err (guard accepts the Files-API handle)")
+    assert_true(type(resp) == 'table' and contract.validateResponse(resp), "fileUri: valid response")
+    assert_eq(calls.n, 1, "fileUri: reached the request builder + posted (one call)")
+    assert_true(type(calls.lastBody) == 'string', "fileUri: a body was posted")
+    local body = type(calls.lastBody) == 'string' and calls.lastBody or ''
+    assert_true(body:find('file_data', 1, true) ~= nil,
+        "fileUri: posted body carries a file_data part")
+    assert_true(body:find('https://files/abc', 1, true) ~= nil,
+        "fileUri: posted body carries the file_uri handle")
+end
+
+-- (8c) [CODEX review] BOTH missing (no b64, no fileUri) -> still fail-fast (nil, err), NO post.
+do
+    local post, calls = scriptedPost({ { status = 200, body = F.SUCCESS_BODY, headers = F.success.headers } })
+    local prov = gemini.new((makeDeps(post)))
+    local r, e = prov.identify({ kind = 'bytes', width = 800, height = 600 }, CTX)
+    assert_true(r == nil and type(e) == 'string' and #e > 0, "no source: fail-fast (nil, err)")
+    assert_eq(calls.n, 0, "no source: NO httpPost call")
+end
+
+-- =====================================================================
 -- (9) NO-LEAK: drive a retry+success and grep the whole recorded surface for forbidden needles —
 --     no 'x-goog-api-key', no token, no '?key=', no raw base64 in any log line.
 -- =====================================================================

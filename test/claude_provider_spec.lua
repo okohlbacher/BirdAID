@@ -378,6 +378,38 @@ do
 end
 
 -- =====================================================================
+-- (8b) [CODEX review] DEEP Files-API handle: image carries fileId (NO b64) -> the guard must NOT
+--      fail-fast; identify reaches the request builder and the posted body carries the file source
+--      (type='file' + file_id). Proves the deep pass no longer dies with missing-image-b64.
+-- =====================================================================
+do
+    local post, calls = scriptedPost({ { status = 200, body = F.SUCCESS_BODY, headers = F.success.headers } })
+    local deps = makeDeps(post)
+    local prov = claude.new(deps)
+    local fileImage = { kind = 'fileId', fileId = 'file_abc', width = 800, height = 600 } -- NO b64
+    local resp, err = prov.identify(fileImage, CTX)
+    assert_true(err == nil, "fileId: no err (guard accepts the Files-API handle)")
+    assert_true(type(resp) == 'table' and contract.validateResponse(resp), "fileId: valid response")
+    assert_eq(calls.n, 1, "fileId: reached the request builder + posted (one call)")
+    assert_true(type(calls.lastBody) == 'string', "fileId: a body was posted")
+    local body = type(calls.lastBody) == 'string' and calls.lastBody or ''
+    assert_true(body:find('"type":"file"', 1, true) ~= nil
+        or body:find('"type": "file"', 1, true) ~= nil,
+        "fileId: posted body carries source.type='file'")
+    assert_true(body:find('file_abc', 1, true) ~= nil,
+        "fileId: posted body carries the file_id handle")
+end
+
+-- (8c) [CODEX review] BOTH missing (no b64, no fileId) -> still fail-fast (nil, err), NO post.
+do
+    local post, calls = scriptedPost({ { status = 200, body = F.SUCCESS_BODY, headers = F.success.headers } })
+    local prov = claude.new((makeDeps(post)))
+    local r, e = prov.identify({ kind = 'bytes', width = 800, height = 600 }, CTX)
+    assert_true(r == nil and type(e) == 'string' and #e > 0, "no source: fail-fast (nil, err)")
+    assert_eq(calls.n, 0, "no source: NO httpPost call")
+end
+
+-- =====================================================================
 -- (9) NO-LEAK: drive a retry+success and grep the whole recorded surface for forbidden needles —
 --     no 'x-api-key', no token, no raw base64, no request-body needle in any log line.
 -- =====================================================================
