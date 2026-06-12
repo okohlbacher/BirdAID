@@ -85,6 +85,8 @@ local batcher        = require 'src.batcher'
 local stagedPool     = require 'src.lr.staged_pool'     -- the SEPARATE-cap host for the deep loop
 local fullresExport  = require 'src.lr.fullres_export'  -- 13-03 full-res render-to-temp glue
 local sweep          = require 'src.crop.sweep'         -- PURE per-run dir + reaper primitives
+local runState       = require 'src.run_state'          -- PURE OUTCOME taxonomy + outcomeFor classifier
+local runStateStore  = require 'src.lr.run_state_store'  -- RETRY: cross-session run-state persistence (glue)
 
 -- Per-invocation monotonic counter so two newRunId() calls within the SAME fractional instant (or
 -- with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives across calls.
@@ -436,7 +438,15 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
 
     local peakConcurrency = nil
 
-    -- poolRun(items, maxC) -> the staged driver at the SEPARATE export cap. Captures peakConcurrency.
+    -- H3: the pool's per-anchor terminal STATUS map, FOLDED across every poolRun (the spike sweeps
+    -- multiple slices; the normal run does one pass). The assembly loop reads it to classify a photo
+    -- whose record never landed as 'cancelled' / 'deferred' (honest accounting) instead of a blanket
+    -- 'not-processed'. statusByAnchorKey is advisory for identified anchors (we read responses from
+    -- resultsByKey) but AUTHORITATIVE for the unresolved (cancelled/deferred/error) skips.
+    local statusByKey = {}
+
+    -- poolRun(items, maxC) -> the staged driver at the SEPARATE export cap. Captures peakConcurrency
+    -- AND folds the returned per-anchor status into the run-wide statusByKey map (H3).
     local function poolRun(items, maxC)
         local r = stagedPool.run({
             items          = items,
@@ -453,6 +463,9 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         })
         if type(r) == 'table' and type(r.peakConcurrency) == 'number' then
             peakConcurrency = math.max(peakConcurrency or 0, r.peakConcurrency)
+        end
+        if type(r) == 'table' and type(r.statusByAnchorKey) == 'table' then
+            for k, st in pairs(r.statusByAnchorKey) do statusByKey[k] = st end
         end
         return r
     end
@@ -507,14 +520,29 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
 
     -- ---- ASSEMBLE the collected records (OUTSIDE any write gate) ---------------------------------
     -- Every selected photo gets a record: the consumer wrote resultsByKey[key]; a photo whose anchor
-    -- never resolved (cancelled/deferred preview) gets a token-free skip so the plan counts honestly.
+    -- never resolved gets a token-free skip so the plan counts honestly. H3: classify that skip from
+    -- the pool's terminal status — 'cancelled' (user cancelled before dispatch) and 'deferred'
+    -- (breaker-open) are HONEST run-level outcomes, NOT failures; anything else stays 'not-processed'.
+    -- The per-outcome counts feed the summary dialog + the final log line AND the run-state persist.
+    local deferredCnt  = 0    -- photos the breaker deferred (never dispatched).
+    local cancelledCnt = 0    -- photos cancelled by the user (never dispatched).
+    local wasCancelled = false
     for i = 1, n do
         local key = items[i]
         local rec = resultsByKey[key]
         if rec == nil then
+            local st = statusByKey[key]
+            local outcomeErr
+            if st == 'cancelled' then
+                outcomeErr = 'cancelled'; cancelledCnt = cancelledCnt + 1; wasCancelled = true
+            elseif st == 'deferred' then
+                outcomeErr = 'deferred'; deferredCnt = deferredCnt + 1
+            else
+                outcomeErr = 'not-processed'
+            end
             rec = {
                 photoKey = key, photo = photos[i], response = nil,
-                error = 'not-processed', existingNames = {},
+                error = outcomeErr, existingNames = {},
             }
         end
         results[#results + 1] = rec
@@ -565,9 +593,74 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         end
     end
 
+    -- ---- RETRY-01: persist the per-photo TERMINAL/RETRYABLE run-state (cross-session) -------------
+    -- Mirrors IdentifyBirds EXACTLY: build a { photoId = uuid, outcome } record for every collected
+    -- photo via the PURE classifier run_state.outcomeFor (the SINGLE source of the status->outcome
+    -- mapping — NEVER re-derived inline). photoId is the per-photo catalog uuid (stableIdFor; a
+    -- nil-uuid photo is NON-RESUMABLE and dropped by save). On a non-dry-run we persist this run's
+    -- state so a later run (Phase 12 retry) can re-process only the incomplete photos; on a fully
+    -- successful run (no retryable photo, no breaker defer, no cancel) we clear the persisted state.
+    if report.dryRun ~= true then
+        -- wroteByKey[photoKey] = number of keywords PLANNED (== written on a committed apply) for this
+        -- photo this run. Sourced from the authoritative whole-run plan, not inline.
+        local wroteByKey = {}
+        for ei = 1, #report.plan.entries do
+            local e = report.plan.entries[ei]
+            local names = (type(e.addKeywords) == 'table') and e.addKeywords or {}
+            wroteByKey[e.photoKey] = #names
+        end
+
+        local records = {}
+        local anyRetryable = false
+        for ri = 1, #results do
+            local rec = results[ri]
+            local resp = rec.response
+            -- Map the collected record to the run_state STATUS vocabulary. A response -> 'identified';
+            -- otherwise the H3 run-level skips ('deferred'/'cancelled') carry through as themselves so
+            -- outcomeFor classifies them retryable; any other no-response record is an 'errored' retry.
+            local status
+            if type(resp) == 'table' then
+                status = 'identified'
+            elseif rec.error == 'deferred' then
+                status = 'deferred'
+            elseif rec.error == 'cancelled' then
+                status = 'cancelled'
+            else
+                status = 'errored'
+            end
+            local birdPresent = (type(resp) == 'table') and resp.bird_present or nil
+            local detectionCount = (type(resp) == 'table' and type(resp.detections) == 'table')
+                and #resp.detections or 0
+            local outcome = runState.outcomeFor({
+                status         = status,
+                birdPresent    = birdPresent,
+                detectionCount = detectionCount,
+                wroteCount     = wroteByKey[rec.photoKey] or 0,
+            })
+            if outcome ~= nil then
+                if not runState.isTerminal(outcome) then anyRetryable = true end
+                records[#records + 1] = {
+                    photoId = runStateStore.stableIdFor(rec.photo),   -- uuid or nil (NON-RESUMABLE)
+                    outcome = outcome,
+                }
+            end
+        end
+
+        -- Fully successful (nothing to resume) only when no photo is retryable AND nothing was
+        -- deferred/cancelled at the run level. Otherwise persist the incomplete-set.
+        local fullyDone = (not anyRetryable) and (deferredCnt == 0) and (cancelledCnt == 0)
+            and (not wasCancelled)
+        if fullyDone then
+            pcall(function() runStateStore.clear() end)
+        else
+            pcall(function() runStateStore.save(runId, records) end)
+        end
+    end
+
     local bstate = breaker.state()
     log.info("deep run finished", {
         runId = runId, total = n, photos = perRun.photos,
+        cancelled = wasCancelled, deferred = deferredCnt, cancelledPhotos = cancelledCnt,
         breakerOpen = bstate.open, breakerConsecutive = bstate.consecutive,
         found = perRun.found, identified = perRun.identified, uncertain = perRun.uncertain,
         errors = perRun.errors, skipped = perRun.skipped,
@@ -587,7 +680,10 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         .. "\nwriteResult: " .. tostring(writeResult)
         .. "  |  breaker open: " .. tostring(bstate.open)
         .. "  |  export cap: " .. tostring(exportCap)
+        .. "  |  deferred: " .. tostring(deferredCnt)
         .. (peakConcurrency and ("  |  peak concurrency: " .. tostring(peakConcurrency)) or "")
+        .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
+        .. (wasCancelled and "  (cancelled)" or "")
         .. "\n\nDetails are in the BirdAID log:\n" .. logPath
 
     local kind = (perRun.errors > 0 or writeResult == 'error' or bstate.open) and "warning" or "info"
