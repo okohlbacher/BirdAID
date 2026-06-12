@@ -471,7 +471,6 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
             cursor = stop + 1
 
             local okClock, t0 = pcall(function() return LrDate.currentTime() end)
-            local before = #results   -- (results is appended after the pool below; use key counts)
             local r = poolRun(slice, capValue)
             local okClock2, t1 = pcall(function() return LrDate.currentTime() end)
             local wall = (okClock and okClock2 and type(t0) == 'number' and type(t1) == 'number')
