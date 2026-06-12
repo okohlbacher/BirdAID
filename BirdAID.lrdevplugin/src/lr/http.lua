@@ -6,7 +6,8 @@
 -- SDK (LrHttp, LrStringUtils, LrPasswords, LrTasks). It is NOT a pure module and is
 -- intentionally EXCLUDED from the negative-purity grep gate (which scopes only the pure src/
 -- modules). It is loaded only by an entry point AFTER birdaid_bootstrap.lua has installed the
--- require shim. openai_http.lua now delegates here so openai/claude/gemini share ONE Lr surface.
+-- require shim. (The former openai_http.lua thin wrapper was retired in Wave-D D3; openai/claude/
+-- gemini all share THIS one Lr surface directly.)
 --
 -- WHAT IT PROVIDES (per-provider, the token VALUE materializes ONLY in this file):
 --   1. M.PLUGIN_ID = "com.okohlbacher.birdaid"  -- single source of truth for the Keychain scope.
@@ -161,7 +162,7 @@ end
 -- ---------------------------------------------------------------------------
 -- attachImage(image) -> image. Sets BOTH image.dataUrl (OpenAI) AND image.b64 (RAW, Claude/Gemini)
 -- in place from the resolved image bytes. Returns the same image for chaining. Idempotent: if
--- image.dataUrl is already set we leave it (mirrors openai_http.attachDataUrl), but we still
+-- image.dataUrl is already set we leave it, but we still
 -- backfill image.b64 from the same source so the raw-base64 consumers also work after a re-attach.
 -- A missing/unreadable source leaves both nil (the provider degrades token-free). NEVER log the
 -- token/body/headers, the raw crop path (PII), or the data URL.

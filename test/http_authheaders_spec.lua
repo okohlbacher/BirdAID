@@ -144,14 +144,14 @@ end
 
 -- =====================================================================
 -- REGRESSION (CODEX MUST-FIX 4): openai {kind=bytes} STILL attaches the data URL; b64 is RAW.
--- We drive openai_http.attachDataUrl (which delegates to http.attachImage) under the same stub.
+-- D3 (M6): the retired openai_http.attachDataUrl was a pure delegate to http.attachImage; we now
+-- drive http.attachImage directly (the live surface) under the same stub.
 -- =====================================================================
 do
-    local openai_http = require('src.lr.openai_http')
-    assert_true(type(openai_http.attachDataUrl) == 'function', "openai_http exposes attachDataUrl")
+    assert_true(type(http.attachImage) == 'function', "http exposes attachImage")
 
     local image = { kind = 'bytes', data = 'ABC' }
-    openai_http.attachDataUrl(image)
+    http.attachImage(image)
 
     assert_true(type(image.dataUrl) == 'string', "attach sets image.dataUrl for {kind=bytes}")
     assert_true(image.dataUrl:sub(1, 23) == 'data:image/jpeg;base64,',

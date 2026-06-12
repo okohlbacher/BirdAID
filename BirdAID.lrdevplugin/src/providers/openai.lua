@@ -141,8 +141,8 @@ function M.new(deps)
 
         -- [CODEX MUST-FIX 2] FAIL FAST on a missing/empty data URL: never send an image_url with
         -- a nil/empty url (the API would 400, or worse we'd post an empty image_url:[] shape).
-        -- The error is token/body-free. The live glue (openai_http) attaches image.dataUrl before
-        -- calling identify; if it is somehow absent we refuse rather than send a malformed body.
+        -- The error is token/body-free. The live glue (src/lr/http.attachImage) attaches image.dataUrl
+        -- before calling identify; if it is somehow absent we refuse rather than send a malformed body.
         local dataUrl = (type(image) == 'table') and image.dataUrl or nil
         if type(dataUrl) ~= 'string'
             or dataUrl:find('data:image/jpeg;base64,', 1, true) ~= 1
