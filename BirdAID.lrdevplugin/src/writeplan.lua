@@ -59,6 +59,21 @@ local M = {}
 -- Rank precedence for singleKeywordPerPhoto (more specific = higher).
 local RANK_SCORE = { species = 3, genus = 2, family = 1 }
 
+-- normName(s): ASCII case-fold + whitespace normalizer for the add-only existing/added diff.
+-- Lowercases, trims leading/trailing whitespace, and collapses internal whitespace runs to a
+-- single space, so a keyword already present that differs only by case or stray spacing
+-- ('northern cardinal (cardinalis cardinalis)' / 'Northern  Cardinal ... ') is recognized and
+-- NOT re-added. The STORED/rendered name is never altered (ADR-001 canonical form unaffected);
+-- this is comparison-only. ASCII case-fold only by design — bird keywords are ASCII Latin/English,
+-- so Unicode case-folding is deliberately out of scope (string.lower suffices).
+local function normName(s)
+    if type(s) ~= 'string' then return s end
+    s = s:lower()
+    s = s:gsub('^%s+', ''):gsub('%s+$', '')   -- trim
+    s = s:gsub('%s+', ' ')                     -- collapse internal runs
+    return s
+end
+
 -- ---------------------------------------------------------------------------
 -- build(results, prefs) -> { plan = {entries=...}, summary = {perRun, perPhoto} }
 -- ---------------------------------------------------------------------------
@@ -160,21 +175,29 @@ function M.build(results, prefs)
                     end
 
                     -- add-only diff: keptNames MINUS this photo's existing names, accumulated
-                    -- across duplicate records (dedupe by name across records too).
+                    -- across duplicate records (dedupe by name across records too). Comparison is
+                    -- NORMALIZED (ASCII case-fold + whitespace, normName) so a keyword already on
+                    -- the photo that differs only by case/spacing is not re-added; the STORED name
+                    -- is the original rendered string (first rendering wins on case-variant ties).
                     local existing = r.existingNames
+                    local existingNorm = {}
+                    if type(existing) == 'table' then
+                        for n in pairs(existing) do existingNorm[normName(n)] = true end
+                    end
                     local entry = entryByKey[key]
-                    local addedNames = seenNamesByKey[key]
+                    local addedNames = seenNamesByKey[key]   -- [normName] = true (cross-record dedupe)
                     for _, rec in ipairs(keptRecs) do
                         local name = rec.name
-                        local already = (type(existing) == 'table' and existing[name]) and true or false
-                        if not already and not (addedNames and addedNames[name]) then
+                        local nn = normName(name)
+                        local already = existingNorm[nn] and true or false
+                        if not already and not (addedNames and addedNames[nn]) then
                             if entry == nil then
                                 entry = { photoKey = key, photo = r.photo, addKeywords = {} }
                                 entryByKey[key] = entry
                                 addedNames = {}
                                 seenNamesByKey[key] = addedNames
                             end
-                            addedNames[name] = true
+                            addedNames[nn] = true
                             entry.addKeywords[#entry.addKeywords + 1] = name
                         end
                     end
