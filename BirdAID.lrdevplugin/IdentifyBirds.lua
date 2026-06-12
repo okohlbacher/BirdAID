@@ -531,7 +531,14 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- (THRU-01 / CODEX MEDIUM-3 eliminates the old per-photo report re-fetch). Keyed by anchor
         -- key (only anchors are fetched; a follower has no own bytes and renders box-only — gallery
         -- handles a nil uri). NEVER logged; lives only in memory for this run.
+        --
+        -- D2 (M9): the carried bytes are read ONLY by the optional detection-report path below
+        -- (the `if prefs.showDetectionReport == true` block at step 5 is the sole reader). When the
+        -- report is OFF we must NOT retain preview JPEG bytes for the whole run — on a large
+        -- selection that is a needless multi-MB-per-photo memory hold. captureForReport gates the
+        -- capture on the report pref; when off, previewByKey stays empty.
         local previewByKey = {}
+        local captureForReport = (prefs.showDetectionReport == true and prefs.dryRun ~= true)
 
         -- producerFetch(anchorKey) -> job | (nil, reason): MAIN-TASK serial preview fetch (the
         -- reliable, one-render-at-a-time path). Stamps job.atIndex for the identify-side logs and
@@ -542,7 +549,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
             local job, reason = fetchJob(photo, anchorKey)
             if job == nil then return nil, reason end
             job.atIndex = anchorKey
-            if type(job.image) == 'table' then
+            if captureForReport and type(job.image) == 'table' then
                 previewByKey[anchorKey] = {
                     bytes  = job.image.data,
                     frameW = job.image.width,
@@ -664,7 +671,7 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         -- (5) OPTIONAL DETECTION REPORT (showDetectionReport, NOT dry-run). Post-collect, OUTSIDE
         -- the gate. The orphan-sweep already ran UNCONDITIONALLY at step 0 -- do NOT re-sweep here.
         -- Guarded per photo; never blocks the run; cancel-aware.
-        if prefs.showDetectionReport == true and prefs.dryRun ~= true then
+        if captureForReport then
             -- GAL-01: ONE combined gallery page, regardless of selection size (the old 20-tab cap is
             -- GONE). THRU-01 / CODEX MEDIUM-3: build the photos array from the CARRIED-FORWARD preview
             -- bytes/dims (previewByKey, captured during the main fetch pass) — NO per-photo re-fetch.
