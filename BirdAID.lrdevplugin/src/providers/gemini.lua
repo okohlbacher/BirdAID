@@ -169,15 +169,20 @@ function M.new(deps)
             return nil, herr
         end
 
-        -- [missing-image fail-fast] Gemini wants RAW base64 in image.b64. Never send an inline_data
-        -- with a nil/empty data field (the API would 400). The error is token/body-free.
+        -- [missing-image fail-fast] Gemini needs EITHER inline RAW base64 in image.b64 (SHALLOW) OR a
+        -- Files-API handle in image.fileUri (DEEP — gemini_request.lua emits a file_data part for it).
+        -- Accept either; fail fast only when BOTH are absent (the API would 400 on an empty source).
+        -- The error is token/body-free.
         local b64 = (type(image) == 'table') and image.b64 or nil
-        if type(b64) ~= 'string' or b64 == '' then
-            local err = 'missing-image-b64'
+        local fileUri = (type(image) == 'table') and image.fileUri or nil
+        local hasB64 = type(b64) == 'string' and b64 ~= ''
+        local hasFileUri = type(fileUri) == 'string' and fileUri ~= ''
+        if not hasB64 and not hasFileUri then
+            local err = 'missing-image-source'
             if type(breaker) == 'table' and type(breaker.record) == 'function' then
                 breaker.record('fatal')
             end
-            safeLog(deps, 'error', 'gemini fatal: image base64 missing/empty (request not sent)',
+            safeLog(deps, 'error', 'gemini fatal: no image source (b64/fileUri both missing; request not sent)',
                 { runId = runId, model = deps.model, error = err })
             return nil, err
         end

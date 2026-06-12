@@ -142,15 +142,20 @@ function M.new(deps)
             return nil, herr
         end
 
-        -- [missing-image fail-fast] Claude wants RAW base64 in image.b64. Never send an image block
-        -- with a nil/empty data field (the API would 400). The error is token/body-free.
+        -- [missing-image fail-fast] Claude needs EITHER inline RAW base64 in image.b64 (SHALLOW) OR a
+        -- Files-API handle in image.fileId (DEEP — claude_request.lua emits source.type='file' for it).
+        -- Accept either; fail fast only when BOTH are absent (the API would 400 on an empty source).
+        -- The error is token/body-free.
         local b64 = (type(image) == 'table') and image.b64 or nil
-        if type(b64) ~= 'string' or b64 == '' then
-            local err = 'missing-image-b64'
+        local fileId = (type(image) == 'table') and image.fileId or nil
+        local hasB64 = type(b64) == 'string' and b64 ~= ''
+        local hasFileId = type(fileId) == 'string' and fileId ~= ''
+        if not hasB64 and not hasFileId then
+            local err = 'missing-image-source'
             if type(breaker) == 'table' and type(breaker.record) == 'function' then
                 breaker.record('fatal')
             end
-            safeLog(deps, 'error', 'claude fatal: image base64 missing/empty (request not sent)',
+            safeLog(deps, 'error', 'claude fatal: no image source (b64/fileId both missing; request not sent)',
                 { runId = runId, model = deps.model, error = err })
             return nil, err
         end
