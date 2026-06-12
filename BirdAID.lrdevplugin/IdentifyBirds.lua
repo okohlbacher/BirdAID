@@ -413,7 +413,6 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
     local wasCancelled = false
     local deferred     = 0    -- photos skipped after the breaker opened / deferred clusters.
     local cancelledCnt = 0    -- photos cancelled (feature branch reports this; serial folds into break).
-    local reportNote   = nil  -- set when the detection report was suppressed (too many to open).
     local peakConcurrency = nil  -- max in-flight AI calls observed (parallel path); nil on serial.
 
     -- The REAL dispatch decision lives in orchestrate.dispatch (spec-driven): at defaults it runs
@@ -841,7 +840,6 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.IdentifyBirds", function(con
         .. (peakConcurrency and ("  |  peak concurrency: " .. tostring(peakConcurrency)) or "")
         .. ((cancelledCnt > 0) and ("  |  cancelled: " .. tostring(cancelledCnt)) or "")
         .. (wasCancelled and "  (cancelled)" or "")
-        .. (reportNote and ("\n\n" .. reportNote) or "")
         .. "\n\nDetails are in the BirdAID log:\n" .. logPath
 
     local kind = (perRun.errors > 0 or writeResult == 'error' or bstate.open) and "warning" or "info"
