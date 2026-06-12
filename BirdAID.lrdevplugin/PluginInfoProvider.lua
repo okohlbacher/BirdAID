@@ -73,11 +73,11 @@ end
 -- classification.
 local function labelForStatus(status)
     if status == "set" then
-        return "Token: set"
+        return "Key: set"
     elseif status == "keychain_error" then
         return "Keychain locked or unavailable -- reopen after unlocking"
     else
-        return "Token: not set"
+        return "Key: not set"
     end
 end
 
@@ -228,6 +228,14 @@ local function sectionsForTopOfDialog(f, propertyTable)
             f:password_field {
                 value = bind { key = 'apiTokenEntry_' .. pos, bind_to_object = propertyTable },
                 width_in_chars = 30,
+            },
+            -- H5 + L1: the value-free per-row key status the section header promises
+            -- ("the status line tells you which rows have a key"). keyRowStatus_<pos> is
+            -- recomputed by refreshKeyList from keystore.statusForSlot (VALUE-FREE -- it is
+            -- "Key: set"/"Key: not set"/keychain-error wording, NEVER the secret).
+            f:static_text {
+                title = bind { key = 'keyRowStatus_' .. pos, bind_to_object = propertyTable },
+                width = 110,
             },
             f:push_button {
                 title  = "Save",
