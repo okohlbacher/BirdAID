@@ -77,7 +77,7 @@ end
 -- repairOnce: drops a contradictory non-empty detections array when bird_present==false.
 -- =====================================================================
 do
-    local r = ru.repairOnce({ bird_present = false, detections = { { x = 1 } } }, 'some-err')
+    local r = ru.repairOnce({ bird_present = false, detections = { { x = 1 } } })
     assert_eq(r.bird_present, false, "repairOnce keeps bird_present false")
     assert_eq(#r.detections, 0, "repairOnce drops contradictory detections")
     -- non-table passes through unchanged.

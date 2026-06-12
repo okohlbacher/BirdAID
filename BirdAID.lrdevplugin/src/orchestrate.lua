@@ -125,10 +125,11 @@ function M.buildAdapterEntries(opts)
             identified = identified + 1
         elseif status == 'cancelled' then
             cancelled = cancelled + 1
-        elseif status == 'error' then
-            errored = errored + 1
         else
-            -- 'deferred' (and any unexpected status) -> no entry, retried next run.
+            -- 'deferred' (and any unexpected status) -> no entry, retried next run. (L6: results.build
+            -- only ever emits identified/cancelled/deferred — never 'error' — so the old
+            -- `status == 'error'` counter branch was unreachable and is removed; the `errored` field
+            -- stays in the returned contract at 0 for shape stability.)
             deferred = deferred + 1
         end
     end

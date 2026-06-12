@@ -98,12 +98,13 @@ function M.salvage(content)
     return false, nil
 end
 
--- repairOnce(resp, verr) -> a structurally repaired COPY (or the same table) to re-validate.
+-- repairOnce(resp) -> a structurally repaired COPY (or the same table) to re-validate.
 -- ONE deterministic fix only (no loop): the documented case is bird_present==false carrying a
 -- non-empty detections array (contradictory; validateResponse rejects it). The honest repair is
 -- to drop the detections (the model said no bird). Any other validation error is NOT auto-repaired
--- here — the caller degrades. Never raises.
-function M.repairOnce(resp, verr)
+-- here — the caller degrades. Never raises. (L7: the validation-error string was never consulted,
+-- so the old `verr` param and the second validateResponse call that produced it are gone.)
+function M.repairOnce(resp)
     if type(resp) ~= 'table' then
         return resp
     end
@@ -127,8 +128,7 @@ function M.finalize(resp)
     if ok then
         return resp
     end
-    local _, verr = contract.validateResponse(resp)
-    local repaired = M.repairOnce(resp, verr)
+    local repaired = M.repairOnce(resp)
     if contract.validateResponse(repaired) then
         return repaired
     end

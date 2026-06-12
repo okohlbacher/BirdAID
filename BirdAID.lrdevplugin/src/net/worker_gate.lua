@@ -52,7 +52,7 @@
 
 local M = {}
 
--- safeCall(fn) -> bool result. An absent/throwing predicate must never crash the gate; a throw or
+-- safeBool(fn) -> bool result. An absent/throwing predicate must never crash the gate; a throw or
 -- a non-function yields a SAFE default of false (not cancelled / not stopping).
 local function safeBool(fn)
     if type(fn) ~= 'function' then return false end

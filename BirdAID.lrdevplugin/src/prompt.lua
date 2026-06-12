@@ -46,8 +46,10 @@ local END_DELIM = "END USER GUIDANCE"
 -- string never appears verbatim in the addition while the user's text stays legible.
 -- string.gsub with plain literal patterns (no magic chars in these tokens) — Lua 5.1 subset.
 local function neutralizeDelimiters(s)
-    -- The shared substring of both delimiters is "USER GUIDANCE"; breaking it neutralizes
-    -- BEGIN/END forms in one pass regardless of case-exact prefix.
+    -- The shared substring of both delimiters is "USER GUIDANCE"; breaking it neutralizes both the
+    -- BEGIN and END forms in ONE pass (both share that substring). The match is CASE-EXACT — it
+    -- defangs only the literal upper-case fence token we emit, which is the only string that could
+    -- forge our real (upper-case) fence boundary.
     s = s:gsub("USER GUIDANCE", "USER_GUIDANCE")
     return (s)
 end

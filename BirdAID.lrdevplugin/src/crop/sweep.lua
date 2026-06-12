@@ -58,10 +58,29 @@ function M.isStaleRunDir(name, ageSecs, thresholdSecs)
     return ageSecs >= thresholdSecs
 end
 
+-- UNIX_TO_COCOA_OFFSET: seconds between the Unix epoch (1970-01-01) and the Cocoa/LrDate epoch
+-- (2001-01-01). os.time() is Unix-epoch; LrFileUtils.fileAttributes().fileModificationDate and
+-- LrDate.currentTime() are Cocoa-epoch. (L8: this constant lived inline in viz_report.sweepOrphans;
+-- it now has a single home so the two dir-staleness sites share one convention.)
+M.UNIX_TO_COCOA_OFFSET = 978307200
+
+-- ageSecsFrom(nowCocoa, modCocoa) -> ageSeconds | nil. PURE staleness helper: both args MUST be in
+-- the SAME (Cocoa/LrDate) epoch — a Unix os.time() caller converts first via UNIX_TO_COCOA_OFFSET.
+-- Returns nil for non-number inputs or a NaN result (caller then treats the dir as NOT stale).
+function M.ageSecsFrom(nowCocoa, modCocoa)
+    if type(nowCocoa) ~= 'number' or type(modCocoa) ~= 'number' then return nil end
+    local age = nowCocoa - modCocoa
+    if age ~= age then return nil end          -- NaN guard
+    return age
+end
+
 -- tempNames(idx) -> { export=, crop=, err= } collision-safe BASENAMES inside the run dir.
--- idx is zero-padded to 5 digits so two different indices never collide.
+-- idx is zero-padded to 5 digits so two different indices never collide. NEW-3: coerce idx to a
+-- non-negative INTEGER first (math.floor(tonumber(idx) or 0)) so string.format('%05d', ...) behaves
+-- IDENTICALLY under LuaJIT and Lua 5.4 on a non-integer/float/non-number idx (5.4's '%d' RAISES on a
+-- float; LuaJIT truncates — the floor makes both deterministic and never raises).
 function M.tempNames(idx)
-    local n = string.format('%05d', idx)
+    local n = string.format('%05d', math.floor(tonumber(idx) or 0))
     return {
         export = 'export-' .. n .. '.jpg',
         crop   = 'crop-' .. n .. '.jpg',

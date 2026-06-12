@@ -130,10 +130,11 @@ function M.sweepOrphans(currentRunId)
                     return LrFileUtils.fileAttributes(entry)
                 end)
                 if okAttr and type(attr) == 'table' and type(attr.fileModificationDate) == 'number' then
-                    -- fileModificationDate is Cocoa-epoch seconds; os.time is Unix-epoch.
-                    local cocoaNow = now - 978307200   -- Unix->Cocoa epoch offset (best-effort)
-                    local a = cocoaNow - attr.fileModificationDate
-                    if a == a then age = a end         -- NaN guard
+                    -- fileModificationDate is Cocoa-epoch seconds; os.time() is Unix-epoch. Convert
+                    -- now into Cocoa via the single-homed offset, then defer to the shared pure
+                    -- staleness helper (L8: one convention for both dir-staleness sites; NaN-guarded).
+                    local cocoaNow = now - sweep.UNIX_TO_COCOA_OFFSET
+                    age = sweep.ageSecsFrom(cocoaNow, attr.fileModificationDate)
                 end
 
                 -- Only when a confirmed age proves staleness do we delete; unknown mtime => keep.

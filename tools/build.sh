@@ -90,12 +90,19 @@ if ls "$OUT"/Debug*.lua >/dev/null 2>&1; then
     exit 1
 fi
 
-# 6b. [CODEX #9] RECURSIVE Debug-clean: NO 'Debug' string ANYWHERE in the dist
-#     (manifest, comments, or any shipped src file). Relies on 08-03 having cleaned the
-#     shipped src tree, so this is the strong, whole-tree claim.
-if grep -rn "Debug" "$OUT" >/dev/null 2>&1; then
-    echo "build: GATE FAILED — 'Debug' string found in the dist (recursive):" >&2
-    grep -rn "Debug" "$OUT" >&2 || true
+# 6b. RECURSIVE Debug-clean, NARROWED (L9): catch a shipped Debug entry point two ways —
+#     (i) any Debug-prefixed FILENAME anywhere in the tree, and (ii) a live REFERENCE to a Debug
+#     module (a `require ...Debug...` or an Info.lua `file = 'Debug...'` manifest entry). The old
+#     gate failed on ANY literal "Debug" substring, so a future comment merely mentioning the word
+#     "debug" would brick the build; this version only fails on a real Debug file or reference.
+if find "$OUT" -name 'Debug*' 2>/dev/null | grep -q .; then
+    echo "build: GATE FAILED — a Debug-prefixed file remains in the dist:" >&2
+    find "$OUT" -name 'Debug*' >&2 || true
+    exit 1
+fi
+if grep -rnE "require[^\n]*Debug|file[[:space:]]*=[[:space:]]*['\"]Debug" "$OUT" >/dev/null 2>&1; then
+    echo "build: GATE FAILED — a live Debug-module reference remains in the dist:" >&2
+    grep -rnE "require[^\n]*Debug|file[[:space:]]*=[[:space:]]*['\"]Debug" "$OUT" >&2 || true
     exit 1
 fi
 

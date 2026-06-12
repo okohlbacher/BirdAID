@@ -1,4 +1,5 @@
--- test/settings_deep_export_spec.lua (Phase 13 Plan 01 — D-03 deepExportConcurrency clamp)
+-- test/settings_deep_prefs_spec.lua (Phase 13 Plan 01 — D-03 deepExportConcurrency clamp)
+-- (L12: renamed from settings_deep_export_spec.lua — it tests deep PREFS normalization, not export.)
 --
 -- Exercises BirdAID.lrdevplugin/src/settings.lua: the SEPARATE export concurrency cap
 -- deepExportConcurrency (D-03). It MUST NOT reuse / alias the AI maxConcurrency — it is a

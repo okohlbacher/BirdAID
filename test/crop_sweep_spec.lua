@@ -109,6 +109,46 @@ do
 end
 
 -- =====================================================================
+-- NEW-3: tempNames coerces idx to a non-negative integer so '%05d' behaves IDENTICALLY under
+-- LuaJIT and Lua 5.4 (5.4's '%d' raises on a float). A non-integer and a float idx both produce a
+-- valid zero-padded name without raising.
+-- =====================================================================
+do
+    -- non-number idx -> floored to 0 (never raises, never a '%d on non-number' error).
+    local nNil = SW.tempNames(nil)
+    assert_eq(nNil.export, 'export-00000.jpg', "tempNames(nil) floors to 0 (no raise)")
+    local nStr = SW.tempNames("not-a-number")
+    assert_eq(nStr.export, 'export-00000.jpg', "tempNames(non-numeric string) floors to 0")
+    -- float idx -> floored to its integer part (3.9 -> 3), identical on 5.4 and LuaJIT.
+    local nFloat = SW.tempNames(3.9)
+    assert_eq(nFloat.export, 'export-00003.jpg', "tempNames(3.9) floors to 3 (no '%d on float' raise)")
+    -- numeric string coerces via tonumber, then floors.
+    local nNumStr = SW.tempNames("12")
+    assert_eq(nNumStr.export, 'export-00012.jpg', "tempNames('12') coerces+floors to 12")
+end
+
+-- =====================================================================
+-- L8: ageSecsFrom(nowCocoa, modCocoa) -> ageSeconds | nil. Pure staleness subtraction with a NaN
+-- guard; both args MUST be the SAME epoch (a Unix caller converts via UNIX_TO_COCOA_OFFSET first).
+-- =====================================================================
+do
+    assert_eq(SW.UNIX_TO_COCOA_OFFSET, 978307200, "UNIX_TO_COCOA_OFFSET is the 1970->2001 second offset")
+
+    assert_eq(SW.ageSecsFrom(1000, 400), 600, "ageSecsFrom: now - mod")
+    assert_eq(SW.ageSecsFrom(500, 500), 0, "ageSecsFrom: equal timestamps -> 0")
+    -- non-number inputs -> nil (caller treats as NOT stale).
+    assert_eq(SW.ageSecsFrom(nil, 100), nil, "ageSecsFrom: nil now -> nil")
+    assert_eq(SW.ageSecsFrom(100, nil), nil, "ageSecsFrom: nil mod -> nil")
+    assert_eq(SW.ageSecsFrom("x", 100), nil, "ageSecsFrom: non-number now -> nil")
+    -- NaN result -> nil.
+    local NAN = 0 / 0
+    assert_eq(SW.ageSecsFrom(NAN, 100), nil, "ageSecsFrom: NaN result -> nil")
+    -- never raises across a small battery.
+    assert_true(pcall(SW.ageSecsFrom, 1, 2), "ageSecsFrom never raises (numbers)")
+    assert_true(pcall(SW.ageSecsFrom, nil, nil), "ageSecsFrom never raises (nils)")
+end
+
+-- =====================================================================
 -- NEVER raises (pcall battery).
 -- =====================================================================
 do

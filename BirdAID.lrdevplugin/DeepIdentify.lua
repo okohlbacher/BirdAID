@@ -154,17 +154,15 @@ local function birdaidTempRoot()
 end
 
 -- dirAgeSecs(path) -> ageSeconds | nil. Compares the dir's fileModificationDate against
--- LrDate.currentTime() (both LrDate epoch). A missing attr -> nil (treated NOT stale by the caller).
+-- LrDate.currentTime() (BOTH already Cocoa/LrDate epoch, so no offset). A missing attr -> nil
+-- (treated NOT stale by the caller). L8: the subtraction + NaN guard is the shared pure
+-- sweep.ageSecsFrom helper (one staleness convention with viz_report's orphan sweep).
 local function dirAgeSecs(path)
     local okNow, now = pcall(function() return LrDate.currentTime() end)
     if not okNow or type(now) ~= 'number' or now ~= now then return nil end
     local okAttr, attr = pcall(function() return LrFileUtils.fileAttributes(path) end)
     if not okAttr or type(attr) ~= 'table' then return nil end
-    local mtime = attr.fileModificationDate
-    if type(mtime) ~= 'number' then return nil end
-    local age = now - mtime
-    if age ~= age then return nil end
-    return age
+    return sweep.ageSecsFrom(now, attr.fileModificationDate)
 end
 
 -- runReaper(root, ownDirName): the STARTUP REAPER. Enumerate <temp>/BirdAID/*, delete each entry
