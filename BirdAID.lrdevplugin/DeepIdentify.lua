@@ -43,6 +43,23 @@
 --     cancel/breaker; a STARTUP REAPER age-gates and removes stale leftover per-run dirs from a prior
 --     crash (sweep.isStaleRunDir, isOurs ^run%- AND age >= 6h), SKIPPING this run's own dir.
 --
+-- ============================================================================
+-- MULTI-KEY FAILOVER FOR THE DEEP PASS (H2) — Files-API choice DOCUMENTED HERE.
+-- ============================================================================
+--   * Mirrors IdentifyBirds' DKEY-02 FAILOVER-ONLY, ONE-ACTIVE-SLOT model: when >1 populated key is
+--     configured (keyOrder_<provider>, slots whose Keychain status is 'set') the per-photo IDENTIFY
+--     runs through keyringRunner.run with an attemptOnce that builds per-slot deps via
+--     http.buildDeps(provider, rawPrefs, { storageIndex = N }) + deps.maxAttempts = 1. With <= 1
+--     populated key the per-photo path is the UNCHANGED, byte-compatible direct provider.identify.
+--   * FILES-API SCOPING CHOICE (CHOSEN: per-attempt re-upload inside attemptOnce): an Anthropic
+--     Files upload is scoped to the API key/workspace, so a file_id created under key A is INVALID
+--     under key B. Therefore for a Files-API provider (Anthropic/Gemini) in a MULTI-KEY run the
+--     upload happens INSIDE attemptOnce against that slot's deps, and that slot's uploaded copy is
+--     deleted in attemptOnce's OWN per-attempt finally BEFORE it returns — so each failover attempt
+--     uploads, identifies, and tears down with one consistent key. OpenAI is inline (no handle, key-
+--     independent), so its multi-key attemptOnce coordinates the IDENTIFY only. The SINGLE-key path
+--     (all providers) keeps the existing body upload + post-pcall handle teardown, byte-compatible.
+--
 -- SC1 EXPORT-CONCURRENCY-CLIFF SPIKE (pref-guarded; 13-05 toggles it): when rawPrefs.deepConcurrencySpike
 -- is true the SAME run varies the export cap across the selection and records wall time + render
 -- failures + peakConcurrency to the log so the recommended default can be tuned against the measured
@@ -87,6 +104,10 @@ local fullresExport  = require 'src.lr.fullres_export'  -- 13-03 full-res render
 local sweep          = require 'src.crop.sweep'         -- PURE per-run dir + reaper primitives
 local runState       = require 'src.run_state'          -- PURE OUTCOME taxonomy + outcomeFor classifier
 local runStateStore  = require 'src.lr.run_state_store'  -- RETRY: cross-session run-state persistence (glue)
+local keystore       = require 'src.lr.keystore'        -- multi-slot secret layer + silent migration
+local keyring        = require 'src.net.keyring'        -- PURE per-slot health/selection state machine
+local keyringRunner  = require 'src.net.keyring_runner'  -- PURE failover coordinator (DKEY-02)
+local backoff        = require 'src.net.backoff'         -- PURE single-key per-attempt sleep fallback
 
 -- Per-invocation monotonic counter so two newRunId() calls within the SAME fractional instant (or
 -- with LrDate unavailable) still get DISTINCT ids. Module-scoped so it survives across calls.
@@ -245,6 +266,51 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         return
     end
 
+    -- ===========================================================================
+    -- MULTI-KEY FAILOVER SETUP (H2) — FAILOVER-ONLY, ONE ACTIVE SLOT (mirrors IdentifyBirds).
+    -- ===========================================================================
+    -- Build the priority order from keyOrder_<provider> (silently migrated on the settings open;
+    -- migrate here too so a never-opened-settings run still upgrades the legacy single key). Only
+    -- slots whose Keychain status is 'set' (a real, populated key) are eligible. With > 1 populated
+    -- key we drive the per-photo IDENTIFY through the failover coordinator (one active slot at a time);
+    -- with <= 1 the per-photo path is the UNCHANGED direct provider.identify (byte-compatible).
+    pcall(function() keystore.migrateIfNeeded(prefs.provider, rawPrefs) end)
+    local priorityOrder = {}
+    do
+        local order = rawPrefs['keyOrder_' .. tostring(prefs.provider)]
+        if type(order) == 'table' then
+            for p = 1, #order do
+                local storageIndex = order[p]
+                if type(storageIndex) == 'number' then
+                    local okS, st = pcall(function()
+                        return keystore.statusForSlot(prefs.provider, storageIndex)
+                    end)
+                    if okS and st == 'set' then
+                        priorityOrder[#priorityOrder + 1] = storageIndex
+                    end
+                end
+            end
+        end
+    end
+    local multiKey = (#priorityOrder > 1)
+    if multiKey then
+        log.info("deep multi-key failover enabled (one active slot; per-photo failover)", {
+            runId = runId, provider = prefs.provider, keys = #priorityOrder,
+        })
+    end
+
+    -- An integer monotonic tick source for the keyring's deterministic select/record. LrDate gives
+    -- fractional seconds; floor to an integer tick. Falls back to os.time(), then 0. This now() is the
+    -- keyring's clock (cooldown windows are measured against it); it advances in real time so a
+    -- slept-out cooldown becomes selectable again on the next select.
+    local function keyringNow()
+        local okF, f = pcall(function() return LrDate.currentTime() end)
+        if okF and type(f) == 'number' and f == f then return math.floor(f) end
+        local okT, t = pcall(os.time)
+        if okT and type(t) == 'number' then return t end
+        return 0
+    end
+
     local progress = LrProgressScope({
         title           = "BirdAID: deep identifying birds",
         functionContext = context,   -- ties the scope lifetime to this task.
@@ -333,64 +399,164 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         local ctx = metadata.shape(raw, rawPrefs)
         ctx.runId = runId
 
-        -- Build the deep image slot. OpenAI: inline the exported frame (attachImage reads the file
-        -- by path, size-capped) + detail='high' (D-01-OPENAI). Anthropic/Gemini: upload by path ->
-        -- Files-API handle (fileId/fileUri). The provider-side handle (if any) is captured here so
-        -- the finally-equivalent teardown below can delete it on BOTH branches.
-        local image
+        -- ---- LIVE deep identify (single-key direct OR multi-key failover) ------------------------
+        -- ok/det/ierr are the normalized result of the identify: ok=false means a RAISED call (det
+        -- carries the error message); ok=true with det==nil means a clean (nil,err) return. det0/ierr0
+        -- below normalize both shapes. `uploadHandle` is the SINGLE-KEY Files-API provider copy that
+        -- the post-pcall teardown deletes (multi-key Files-API runs delete their per-slot copy INSIDE
+        -- attemptOnce, so uploadHandle stays nil on that path).
+        local ok, det, ierr
         local uploadHandle = nil
 
-        if isOpenAI then
-            image = { kind = 'file', path = path, detail = 'high' }   -- D-01-OPENAI high-detail tiling
-            http.attachImage(image)   -- sets image.dataUrl from the file bytes (no network)
-        else
-            local handle, ureason = http.uploadFile(prefs.provider, path, deps)
-            if handle ~= nil then
-                uploadHandle = handle
-                image = {
-                    kind   = 'file',
-                    fileId = handle.fileId,    -- Anthropic Files-API source
-                    fileUri = handle.fileUri,  -- Gemini Files-API part
-                }
+        if not multiKey then
+            -- ===== SINGLE-KEY: the UNCHANGED, byte-compatible direct path. =====
+            -- Build the deep image slot. OpenAI: inline the exported frame (attachImage reads the file
+            -- by path, size-capped) + detail='high'. Anthropic/Gemini: upload by path -> Files-API
+            -- handle. The provider-side handle (if any) is deleted in the post-pcall teardown.
+            local image
+            if isOpenAI then
+                image = { kind = 'file', path = path, detail = 'high' }   -- D-01-OPENAI high-detail tiling
+                http.attachImage(image)   -- sets image.dataUrl from the file bytes (no network)
             else
-                -- Upload failed: skip this photo cleanly (token/path-free reason). No handle to delete.
-                -- NEW-1: delete the per-photo exported temp JPEG BEFORE returning so a failed upload
-                -- never leaks a full-res frame into the run dir until the 6h reaper (count-only log).
-                if type(path) == 'string' and path ~= '' then
-                    pcall(function() LrFileUtils.delete(path) end)
+                local handle, ureason = http.uploadFile(prefs.provider, path, deps)
+                if handle ~= nil then
+                    uploadHandle = handle
+                    image = {
+                        kind   = 'file',
+                        fileId = handle.fileId,    -- Anthropic Files-API source
+                        fileUri = handle.fileUri,  -- Gemini Files-API part
+                    }
+                else
+                    -- Upload failed: skip this photo cleanly (token/path-free reason). No handle to delete.
+                    -- NEW-1: delete the per-photo exported temp JPEG BEFORE returning so a failed upload
+                    -- never leaks a full-res frame into the run dir until the 6h reaper (count-only log).
+                    if type(path) == 'string' and path ~= '' then
+                        pcall(function() LrFileUtils.delete(path) end)
+                    end
+                    log.info("deep upload produced no handle (skipping identify; run continues)", {
+                        runId = runId, atIndex = job.index, file = file, reason = tostring(ureason),
+                    })
+                    resultsByKey[job.key] = {
+                        photoKey = job.key, photo = job.photo, response = nil,
+                        error = 'upload:' .. tostring(ureason),
+                        existingNames = catalogWriter.readExistingNames(job.photo),
+                    }
+                    return 'error'
                 end
-                log.info("deep upload produced no handle (skipping identify; run continues)", {
-                    runId = runId, atIndex = job.index, file = file, reason = tostring(ureason),
-                })
-                resultsByKey[job.key] = {
-                    photoKey = job.key, photo = job.photo, response = nil,
-                    error = 'upload:' .. tostring(ureason),
-                    existingNames = catalogWriter.readExistingNames(job.photo),
-                }
-                return 'error'
+            end
+
+            -- The provider call YIELDS (LrHttp.post) -> isolate with LrTasks.pcall (yield-safe;
+            -- standard pcall forbids yielding across the C-frame). The provider-copy DELETE runs in the
+            -- finally-equivalent block AFTER this pcall.
+            ok, det, ierr = LrTasks.pcall(function()
+                return provider.identify(image, ctx)
+            end)
+        else
+            -- ===== MULTI-KEY: the per-photo FAILOVER COORDINATOR (one active slot at a time). =====
+            -- attemptOnce(storageIndex) builds per-slot deps (maxAttempts=1) and returns the provider's
+            -- STRUCTURED single-attempt result so keyringRunner maps failover by the reliable HTTP
+            -- status (D-04). FILES-API SCOPING (header decision): a Files upload is key-scoped, so for
+            -- Anthropic/Gemini the upload AND its teardown happen INSIDE the per-slot attempt — each
+            -- failover attempt uploads, identifies, and deletes with ONE consistent key. OpenAI inlines
+            -- the frame (key-independent) and coordinates the IDENTIFY only.
+            local function attemptOnce(storageIndex)
+                local slotDeps, sderr = http.buildDeps(prefs.provider, rawPrefs, { storageIndex = storageIndex })
+                if not slotDeps then
+                    -- A slot that cannot build deps (its key vanished mid-run) is a transient retry so
+                    -- the coordinator fails over to the next healthy slot. Token-free err.
+                    return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                             err = 'slot-deps-unavailable' }
+                end
+                slotDeps.maxAttempts = 1     -- single-attempt mode: the coordinator owns retry/failover.
+                slotDeps.breaker = breaker   -- present but UNUSED in single-attempt mode.
+                slotDeps.runId   = runId
+
+                local slotProvider, sperr = providers.get(prefs.provider, slotDeps)
+                if not slotProvider then
+                    return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                             err = 'slot-provider-unavailable' }
+                end
+
+                -- Build this slot's image. OpenAI: inline (no per-slot upload). Files-API: upload by
+                -- path with THIS slot's deps so the file_id is valid under this key.
+                local image
+                local slotHandle = nil
+                if isOpenAI then
+                    image = { kind = 'file', path = path, detail = 'high' }
+                    http.attachImage(image)
+                else
+                    local handle, ureason = http.uploadFile(prefs.provider, path, slotDeps)
+                    if handle == nil then
+                        -- A per-slot upload failure is a transient retry: the coordinator fails over to
+                        -- the next slot (which re-uploads under its own key). Token/path-free.
+                        return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                                 err = 'upload:' .. tostring(ureason) }
+                    end
+                    slotHandle = handle
+                    image = { kind = 'file', fileId = handle.fileId, fileUri = handle.fileUri }
+                end
+
+                -- The single attempt against this slot. slotProvider.identify YIELDS, but attemptOnce
+                -- itself is already invoked from inside the pool consumer's yield-safe context (the pool
+                -- wraps the consumer in LrTasks.pcall); the provider's own deps.pcall (LrTasks.pcall)
+                -- isolates the yielding HTTP post. We pcall it here only to GUARANTEE the per-slot file
+                -- teardown runs even on a raise.
+                local okR, r = LrTasks.pcall(function()
+                    return slotProvider.identify(image, ctx)
+                end)
+
+                -- PER-ATTEMPT FINALLY (Files-API): delete THIS slot's uploaded copy before returning,
+                -- on BOTH branches, so a failover never leaves a slot's file behind. Gemini is a no-op.
+                if slotHandle ~= nil then
+                    pcall(function() http.deleteFile(prefs.provider, slotHandle, slotDeps) end)
+                end
+
+                if not okR then
+                    -- A raised identify: treat as a transient retry (token-free; the coordinator decides).
+                    return { outcome = 'retry', status = nil, retryAfter = nil, response = nil,
+                             err = 'identify-raised' }
+                end
+                if type(r) == 'table' and r.outcome ~= nil then
+                    return r   -- the structured single-attempt result (status preserved for the split).
+                end
+                -- Defensive: a provider that returned the legacy (response)|(nil,err) shape.
+                if type(r) == 'table' then
+                    return { outcome = 'ok', status = 200, retryAfter = nil, response = r, err = nil }
+                end
+                return { outcome = 'retry', status = nil, retryAfter = nil, response = nil, err = 'identify-failed' }
+            end
+
+            local kr = keyring.new({ priorityOrder = priorityOrder })
+            local result = keyringRunner.run({
+                keyring       = kr,
+                attemptOnce   = attemptOnce,
+                now           = keyringNow,
+                sleep         = LrTasks.sleep,
+                breaker       = breaker,
+                backoff       = backoff,
+                priorityCount = #priorityOrder,
+            })
+            if type(result) == 'table' and result.response ~= nil then
+                ok, det, ierr = true, result.response, nil
+            else
+                -- request-fatal / all-keys-down: surface the token-free err (or a generic deferral).
+                ok = true
+                det = nil
+                ierr = (type(result) == 'table' and result.err) or 'identify-deferred'
             end
         end
 
-        -- LIVE deep identify. The provider call YIELDS (LrHttp.post) -> isolate with LrTasks.pcall
-        -- (yield-safe; standard pcall forbids yielding across the C-frame). ok/error are both handled
-        -- below, and the provider-copy DELETE runs in a finally-equivalent block AFTER this pcall.
-        local ok, det, ierr = LrTasks.pcall(function()
-            return provider.identify(image, ctx)
-        end)
-
         -- ---- FINALLY-EQUIVALENT TEARDOWN (D-01b) -------------------------------------------------
-        -- Delete the Anthropic provider-side copy on BOTH the ok AND the error branch (reached
-        -- whether the identify succeeded, returned (nil,err), or RAISED). This is NOT nested inside
-        -- `if ok then` — it runs unconditionally after the pcall whenever a handle was created.
-        -- Gemini is a no-op (48h auto-expiry); OpenAI never uploads (no handle). Token/path-free.
+        -- Delete the SINGLE-KEY Anthropic provider-side copy on BOTH the ok AND the error branch
+        -- (multi-key Files-API already deleted its per-slot copy inside attemptOnce; OpenAI never
+        -- uploads). Gemini is a no-op (48h auto-expiry). Token/path-free.
         if uploadHandle ~= nil then
             pcall(function() http.deleteFile(prefs.provider, uploadHandle, deps) end)
         end
 
         -- NEW-1: delete the per-photo EXPORTED temp JPEG in the SAME finally-equivalent teardown,
-        -- reached on BOTH the ok AND the error branch (whether identify succeeded, returned (nil,err),
-        -- or RAISED). Without this the full-res frames accumulate in the run dir for the whole run and
-        -- survive a crash up to the 6h reaper. The end-of-run dir cleanup + reaper remain as backstops.
+        -- reached on BOTH branches. Without this the full-res frames accumulate in the run dir for the
+        -- whole run and survive a crash up to the 6h reaper. The dir cleanup + reaper remain backstops.
         -- Token/path-free: NEVER log `path` (PII); best-effort delete, absence is fine.
         if type(path) == 'string' and path ~= '' then
             pcall(function() LrFileUtils.delete(path) end)
