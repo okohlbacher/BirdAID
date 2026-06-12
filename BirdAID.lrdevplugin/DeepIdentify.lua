@@ -43,7 +43,7 @@
 --     cancel/breaker; a STARTUP REAPER age-gates and removes stale leftover per-run dirs from a prior
 --     crash (sweep.isStaleRunDir, isOurs ^run%- AND age >= 6h), SKIPPING this run's own dir.
 --
--- SC1 EXPORT-CONCURRENCY-CLIFF SPIKE (pref-guarded; 13-05 toggles it): when prefs.deepConcurrencySpike
+-- SC1 EXPORT-CONCURRENCY-CLIFF SPIKE (pref-guarded; 13-05 toggles it): when rawPrefs.deepConcurrencySpike
 -- is true the SAME run varies the export cap across the selection and records wall time + render
 -- failures + peakConcurrency to the log so the recommended default can be tuned against the measured
 -- render cliff. When the pref is false/nil the spike code is INERT. There is NO separate dev-harness
@@ -201,7 +201,10 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
     log.info("deep run started", {
         runId = runId, targetPhotos = n, provider = prefs.provider, model = prefs.model,
         deepExportConcurrency = exportCap, dryRun = prefs.dryRun, os = osToken, logFile = logPath,
-        spike = prefs.deepConcurrencySpike == true,
+        -- deepConcurrencySpike is a deliberate RAW diagnostic flag (13-05 sweep toggle), NOT a
+        -- normalized setting: it is absent from settings.DEFAULTS so normalizedPrefs drops it.
+        -- Read it off rawPrefs so the flag can actually activate (H1 fix).
+        spike = rawPrefs.deepConcurrencySpike == true,
     })
 
     if n == 0 then
@@ -445,13 +448,15 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
     for i = 1, n do items[i] = tostring(photos[i]) end
 
     -- ============================================================================
-    -- SC1 EXPORT-CONCURRENCY-CLIFF SPIKE — pref-guarded (prefs.deepConcurrencySpike). When OFF
+    -- SC1 EXPORT-CONCURRENCY-CLIFF SPIKE — pref-guarded (rawPrefs.deepConcurrencySpike). When OFF
     -- (default) this branch is inert and the run drives ONE poolRun at the configured exportCap.
     -- When ON, the SAME run sweeps the export cap over a fixed ladder, splitting the selection into
     -- equal slices and recording wall time + render failures + peakConcurrency per cap to the log so
     -- the 13-05 protocol can read the render cliff. NO separate harness entry, NO forbidden token.
     -- ============================================================================
-    if prefs.deepConcurrencySpike == true and n >= 2 then
+    -- Raw diagnostic flag (see log-line note above): absent from settings.DEFAULTS, so it must be
+    -- read off rawPrefs — normalizedPrefs would drop it and the spike could never activate (H1 fix).
+    if rawPrefs.deepConcurrencySpike == true and n >= 2 then
         local ladder = { 1, 2, 3, 4 }
         local slices = #ladder
         local per = math.floor(n / slices)
