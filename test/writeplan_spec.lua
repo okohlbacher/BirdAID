@@ -445,6 +445,12 @@ do
     assert_true(e ~= nil, "A1(c): one entry for the photo")
     assert_eq(#e.addKeywords, 1, "A1(c): exactly one add (case-variants dedupe)")
     assert_eq(e.addKeywords[1], CARDINAL, "A1(c): first rendering wins as the stored form")
+    -- [CODEX review] the identified count must ALSO honor the cross-record normalized dedupe:
+    -- two case-variant records collapse to ONE add, so they count identified ONCE (not 2).
+    local p = out.summary.perPhoto['Nc']
+    assert_eq(p.identified, 1, "A1(c): identified counted ONCE (cross-record normalized dedupe)")
+    assert_eq(p.uncertain, 0, "A1(c): uncertain 0")
+    assert_eq(p.addCount, 1, "A1(c): addCount 1 matches the count")
 end
 
 do
