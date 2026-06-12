@@ -88,6 +88,39 @@ do
     assert_eq(out.peakConcurrency, 2, "peakConcurrency: reaches and is bounded by maxConcurrency")
 end
 
+-- (1c) D6/M7: when the producer loop ends with consumers STILL in-flight, the drain phase sets a
+--      ONE-TIME "Finishing N in-flight…" caption (the existing setCaption seam) before the drain
+--      sleeps. The scheduler's no-op yield makes every dispatched consumer accumulate as in-flight
+--      until the drain's sleeps run them, so the drain caption is guaranteed to fire here. Completion
+--      semantics are unchanged: every item still resolves.
+do
+    local s = newSched()
+    local captions = {}
+    local fakeProgress = {
+        setPortionComplete = function() end,
+        setCaption = function(_, text) captions[#captions + 1] = text end,
+    }
+    local out = staged.run({
+        items = { 'a', 'b', 'c' },
+        maxConcurrency = 3,
+        fetchJob = function(k) return { key = k } end,
+        identifyJob = function() return 'identified', {} end,
+        spawn = s.spawn, sleep = s.sleep, yield = s.yield,
+        progress = fakeProgress,
+    })
+    assert_true(keysResolved(out, { 'a', 'b', 'c' }), "D6: all items still resolve (semantics unchanged)")
+    -- A "Finishing N in-flight…" caption appears exactly once, BEFORE the terminal "Processed" one.
+    local drainIdx, drainText
+    for ci = 1, #captions do
+        if captions[ci]:find("Finishing", 1, true) then drainIdx = ci; drainText = captions[ci] end
+    end
+    assert_true(drainIdx ~= nil, "D6: a 'Finishing N in-flight' drain caption was set")
+    assert_eq(drainText, "Finishing 3 in-flight\226\128\166",
+        "D6: drain caption reports the in-flight count with the UTF-8 ellipsis")
+    assert_eq(captions[#captions], "Processed 3 of 3",
+        "D6: the LAST caption is still the terminal X-of-Y (drain caption preceded it)")
+end
+
 -- (2) a preview-fetch failure (fetchJob nil) -> 'error'; identifyJob NEVER called for it.
 do
     local s = newSched()

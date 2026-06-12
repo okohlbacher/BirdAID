@@ -150,6 +150,17 @@ function M.run(opts)
     end
 
     -- DRAIN: wait for all in-flight consumers to finish before returning the terminal maps.
+    -- D6 (M7): completion semantics are spec-pinned (in-flight work MUST complete) — the sleeps stay
+    -- as-is. We only improve the UX: set the caption ONCE at drain start to "Finishing N in-flight…"
+    -- via the SAME injected progress/caption seam used by bumpProgress, so the user sees why the run
+    -- is still busy after the last anchor dispatched (the bar would otherwise sit silent). Guarded
+    -- and non-yielding; never blocks the drain.
+    if inFlight > 0 and type(progress) == 'table' and type(progress.setCaption) == 'function' then
+        local remaining = inFlight
+        protect(function()
+            progress:setCaption(string.format("Finishing %d in-flight\226\128\166", remaining))
+        end)
+    end
     while inFlight > 0 do
         sleep(0.05)
     end
