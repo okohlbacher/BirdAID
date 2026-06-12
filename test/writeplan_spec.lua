@@ -398,3 +398,64 @@ do
     local out = W.build(results, PREFS)
     assert_eq(entryFor(out.plan, 'U'), nil, "BL-15: writable name already present -> no entry")
 end
+
+-- =====================================================================
+-- 14. A1: NORMALIZED existing-keyword comparison (dedup hardening).
+--     The add-only diff must recognize an already-present keyword that differs only by
+--     ASCII case or whitespace (case-fold + trim + collapse internal runs), so a re-run
+--     never re-adds it. The STORED form remains the original rendered string.
+-- =====================================================================
+do
+    -- (a) existing lower-cased form -> incoming canonical-cased rendering produces ZERO adds.
+    local results = {
+        { photoKey = 'Na', photo = 'hNa',
+          response = resp(true, { speciesDet('Northern Cardinal', 'Cardinalis cardinalis', 0.82) }),
+          existingNames = { ['northern cardinal (cardinalis cardinalis)'] = true } },
+    }
+    local out = W.build(results, PREFS)
+    assert_eq(entryFor(out.plan, 'Na'), nil, "A1(a): case-only existing match -> no entry")
+    assert_eq(out.summary.perPhoto['Na'].addCount, 0, "A1(a): addCount 0")
+end
+
+do
+    -- (b) existing with trailing space AND a double internal space -> ZERO adds.
+    local results = {
+        { photoKey = 'Nb', photo = 'hNb',
+          response = resp(true, { speciesDet('Northern Cardinal', 'Cardinalis cardinalis', 0.82) }),
+          existingNames = { ['Northern  Cardinal (Cardinalis cardinalis) '] = true } },
+    }
+    local out = W.build(results, PREFS)
+    assert_eq(entryFor(out.plan, 'Nb'), nil, "A1(b): whitespace-variant existing match -> no entry")
+    assert_eq(out.summary.perPhoto['Nb'].addCount, 0, "A1(b): addCount 0")
+end
+
+do
+    -- (c) two incoming records for the SAME photo differing only by case -> ONE add
+    --     (first rendering wins; the stored form is the first record's canonical render).
+    local results = {
+        { photoKey = 'Nc', photo = 'hNc',
+          response = resp(true, { speciesDet('Northern Cardinal', 'Cardinalis cardinalis', 0.82) }),
+          existingNames = {} },
+        { photoKey = 'Nc', photo = 'hNc',
+          response = resp(true, { speciesDet('NORTHERN CARDINAL', 'CARDINALIS CARDINALIS', 0.82) }),
+          existingNames = {} },
+    }
+    local out = W.build(results, PREFS)
+    local e = entryFor(out.plan, 'Nc')
+    assert_true(e ~= nil, "A1(c): one entry for the photo")
+    assert_eq(#e.addKeywords, 1, "A1(c): exactly one add (case-variants dedupe)")
+    assert_eq(e.addKeywords[1], CARDINAL, "A1(c): first rendering wins as the stored form")
+end
+
+do
+    -- (d) a genuinely-new name still adds (the normalizer must not over-collapse).
+    local results = {
+        { photoKey = 'Nd', photo = 'hNd',
+          response = resp(true, { speciesDet('Blue Jay', 'Cyanocitta cristata', 0.82) }),
+          existingNames = { ['northern cardinal (cardinalis cardinalis)'] = true } },
+    }
+    local out = W.build(results, PREFS)
+    local e = entryFor(out.plan, 'Nd')
+    assert_true(e ~= nil, "A1(d): new name produces an entry")
+    assert_eq(e.addKeywords[1], 'Blue Jay (Cyanocitta cristata)', "A1(d): the new keyword adds")
+end

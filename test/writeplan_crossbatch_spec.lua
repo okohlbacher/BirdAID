@@ -63,6 +63,30 @@ end
 
 local CARDINAL = "Northern Cardinal (Cardinalis cardinalis)"
 
+-- recCased(photoKey, common, scientific): same shape as recFor but with caller-chosen names,
+-- used by the A1 cross-batch normalization case (a name committed in batch 1 must not be
+-- re-added in batch 2 even when batch 2 renders a different ASCII case).
+local function recCased(photoKey, common, scientific)
+    return {
+        photoKey = photoKey,
+        photo = nil,
+        response = {
+            bird_present = true,
+            detections = {
+                {
+                    bbox = { 0.1, 0.1, 0.9, 0.9 },
+                    common_name = common,
+                    scientific_name = scientific,
+                    confidence = 0.95,
+                    identified_rank = "species",
+                },
+            },
+        },
+        error = nil,
+        existingNames = {},
+    }
+end
+
 -- Count how many addKeywords entries a plan has for a given photoKey (across its entries).
 local function addsForKey(plan, key)
     local count = 0
@@ -180,6 +204,28 @@ do
     end
     -- And the returned aggregate exposes per-chunk status for the caller/report.
     -- (one chunk ⇒ one status entry)
+end
+
+-- =====================================================================
+-- (A1) CROSS-BATCH NORMALIZATION: a name committed in batch 1 (canonical case) is NOT re-added
+--      in batch 2 even though batch 2 renders an upper-case variant of the same keyword. The
+--      committed canonical form is folded forward into existingNames; the writeplan diff
+--      normalizes (ASCII case-fold + whitespace) at comparison time, so the case-variant matches.
+-- =====================================================================
+do
+    local results = {
+        recCased("p1", "Northern Cardinal", "Cardinalis cardinalis"),  -- batch 1 -> canonical
+        recCased("p1", "NORTHERN CARDINAL", "CARDINALIS CARDINALIS"),  -- batch 2 -> upper-case
+    }
+    local spy = makeSpy({ 'executed', 'executed' })
+    local prefs = { writeBatchSize = 1, confidenceThreshold = 0.6 }
+
+    local out = batcher.flushAll(results, prefs, spy.fn)
+    assert_eq(out.applyCount, 2, "A1 cross-batch: apply fired twice")
+    assert_eq(addsForKey(spy.plans[1], "p1"), 1, "A1 cross-batch: batch 1 commits the canonical name")
+    assert_eq(spy.plans[1].entries[1].addKeywords[1], CARDINAL, "A1 cross-batch: batch 1 stores canonical form")
+    assert_eq(addsForKey(spy.plans[2], "p1"), 0,
+        "A1 cross-batch: batch 2 case-variant matches folded canonical -> ZERO re-add")
 end
 
 -- =====================================================================
