@@ -157,6 +157,35 @@ local function clearKeyEntries(propertyTable)
     end
 end
 
+-- M5 + L3: build a standard NUMERIC settings row (label + bounded edit_field). The hand-built
+-- numeric rows previously had no min/max/precision and so let junk persist raw, clamping only
+-- silently at run time inside settings.normalizedPrefs. numRow attaches the SDK edit_field's
+-- numeric guard rails (min/max/precision) so the UI rejects/clamps at entry, and pins ONE label
+-- width (180) -- fixing the L3 140/180 drift between sections.
+--
+-- The UI bounds passed here MUST mirror the matching settings.validate clamp EXACTLY (the field
+-- and the read-through accessor must agree); each call site names the settings.lua clamp it
+-- mirrors. Numeric edit_field properties (min, max, precision) are the documented LrView numeric
+-- guards; immediate=false is KEPT (commit on focus-out, matching every existing field) so a
+-- partially-typed value is not clamped on each keystroke.
+--   opts.min, opts.max  -- numeric bounds (REQUIRED; mirror the settings.lua clamp)
+--   opts.precision      -- decimal places (default 0 = integer; e.g. 2 for confidenceThreshold)
+local NUM_LABEL_WIDTH = 180
+local function numRow(f, prefs, labelText, prefKey, opts)
+    local bind = LrView.bind
+    return f:row {
+        f:static_text { title = labelText, width = NUM_LABEL_WIDTH },
+        f:edit_field {
+            value     = bind { key = prefKey, bind_to_object = prefs },
+            min       = opts.min,
+            max       = opts.max,
+            precision = opts.precision or 0,
+            width_in_chars = 6,
+            immediate = false,
+        },
+    }
+end
+
 local function sectionsForTopOfDialog(f, propertyTable)
     local prefs = LrPrefs.prefsForPlugin()
     ensureDefaults(prefs)
@@ -426,23 +455,13 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 },
             },
 
-            f:row {
-                f:static_text { title = "Confidence threshold:", width = 140 },
-                f:edit_field {
-                    value = bind { key = 'confidenceThreshold', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate confidenceThreshold: clampNumber 0..1 default 0.6
+            numRow(f, prefs, "Confidence threshold:", 'confidenceThreshold',
+                { min = 0, max = 1, precision = 2 }),
 
-            f:row {
-                f:static_text { title = "Preview size (px):", width = 140 },
-                f:edit_field {
-                    value = bind { key = 'previewSize', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate previewSize: clampNumber 512..8192 default 2048
+            numRow(f, prefs, "Preview size (px):", 'previewSize',
+                { min = 512, max = 8192, precision = 0 }),
 
             f:row {
                 f:checkbox {
@@ -477,14 +496,9 @@ local function sectionsForTopOfDialog(f, propertyTable)
             title    = "BirdAID - Throughput & clustering",
             synopsis = "Parallel requests and burst/stack clustering (all OFF/serial by default).",
 
-            f:row {
-                f:static_text { title = "Number of parallel requests:", width = 180 },
-                f:edit_field {
-                    value = bind { key = 'maxConcurrency', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate maxConcurrency: clampInt 1..50 default 1
+            numRow(f, prefs, "Number of parallel requests:", 'maxConcurrency',
+                { min = 1, max = 50, precision = 0 }),
             f:row {
                 f:static_text {
                     title = "How many photos are sent to the AI at the same time (1-50). " ..
@@ -502,14 +516,9 @@ local function sectionsForTopOfDialog(f, propertyTable)
             -- full-res exports are the exact risk class v1's preview-timeout cliff guarded, so
             -- this is its own knob (clamped 1-4, default 2; the spike-tuned escape hatch). Binds
             -- EXPLICITLY to prefs (bind_to_object = prefs) so it persists; NO secret here.
-            f:row {
-                f:static_text { title = "Deep export parallelism:", width = 180 },
-                f:edit_field {
-                    value = bind { key = 'deepExportConcurrency', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate deepExportConcurrency: clampInt 1..4 default 2
+            numRow(f, prefs, "Deep export parallelism:", 'deepExportConcurrency',
+                { min = 1, max = 4, precision = 0 }),
             f:row {
                 f:static_text {
                     title = "Full-res export parallelism for \"Deep identify…\": 1-4, default 2; " ..
@@ -527,28 +536,18 @@ local function sectionsForTopOfDialog(f, propertyTable)
                     value = bind { key = 'clusterBursts', bind_to_object = prefs },
                 },
             },
-            f:row {
-                f:static_text { title = "Max gap (seconds):", width = 180 },
-                f:edit_field {
-                    value = bind { key = 'clusterMaxGapSeconds', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate clusterMaxGapSeconds: clampNumber 0..30 default 1.0
+            numRow(f, prefs, "Max gap (seconds):", 'clusterMaxGapSeconds',
+                { min = 0, max = 30, precision = 1 }),
             f:row {
                 f:checkbox {
                     title = "Also cluster photos in the same Lightroom stack",
                     value = bind { key = 'clusterUseStacks', bind_to_object = prefs },
                 },
             },
-            f:row {
-                f:static_text { title = "Similarity threshold:", width = 180 },
-                f:edit_field {
-                    value = bind { key = 'clusterSimilarityThreshold', bind_to_object = prefs },
-                    width_in_chars = 6,
-                    immediate = false,
-                },
-            },
+            -- mirrors settings.validate clusterSimilarityThreshold: clampInt 0..64 default 10
+            numRow(f, prefs, "Similarity threshold:", 'clusterSimilarityThreshold',
+                { min = 0, max = 64, precision = 0 }),
             f:row {
                 f:static_text {
                     title = "Hamming distance 0..64 over an 8x8 average-hash; LOWER = stricter " ..
