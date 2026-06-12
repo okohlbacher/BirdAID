@@ -530,6 +530,19 @@ local function sectionsForTopOfDialog(f, propertyTable)
                 },
             },
 
+            -- M4: the Phase-12 WBATCH pref (BL-14) is validated + consumed by writeplan but had
+            -- no UI. mirrors settings.validate writeBatchSize: clampInt 0..100000 default 0.
+            numRow(f, prefs, "Keyword write batch size:", 'writeBatchSize',
+                { min = 0, max = 100000, precision = 0 }),
+            f:row {
+                f:static_text {
+                    title = "0 = single write at end of run; 1+ = flush incrementally during " ..
+                            "long runs.",
+                    width_in_chars = 60,
+                    height_in_lines = 2,
+                },
+            },
+
             f:row {
                 f:checkbox {
                     title = "Cluster bursts (identify one anchor per near-duplicate group)",
