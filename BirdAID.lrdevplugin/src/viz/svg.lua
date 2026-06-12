@@ -22,19 +22,13 @@
 --
 -- Strictly Lua 5.1 common subset: no \u{}, no //, no goto, no <close>; unpack global.
 
+local xml = require('src.viz.xml')
+
 local M = {}
 
--- xmlEscape(s): escape the five XML special chars. & MUST be escaped FIRST so the entity
--- ampersands introduced by the later replacements are not double-escaped.
-local function xmlEscape(s)
-    s = tostring(s == nil and "" or s)
-    s = s:gsub("&", "&amp;")
-    s = s:gsub("<", "&lt;")
-    s = s:gsub(">", "&gt;")
-    s = s:gsub('"', "&quot;")
-    s = s:gsub("'", "&#39;")
-    return s
-end
+-- xmlEscape: the single-source escaper (src.viz.xml). & is escaped FIRST so the entity ampersands
+-- introduced by the later replacements are not double-escaped (see src/viz/xml.lua).
+local xmlEscape = xml.xmlEscape
 
 -- numOr(v, default): a finite number, else the default. Used to coerce frame dims defensively.
 local INF = 1 / 0

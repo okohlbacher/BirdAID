@@ -13,8 +13,9 @@
 -- SECURITY:
 --   * Markup injection (T-12-04 / ASVS V5): EVERY dynamic string (file label, detection label,
 --     any user-prompt-derived text reflected in a caption) passes through xmlEscape BEFORE embed.
---     xmlEscape is COPIED VERBATIM from svg.lua (& escaped FIRST so the entity ampersands of the
---     later replacements are not double-escaped). There is NO public raw HTML/SVG body passthrough
+--     xmlEscape is the single-source escaper from src.viz.xml (shared with svg.lua; & escaped FIRST
+--     so the entity ampersands of the later replacements are not double-escaped). There is NO public
+--     raw HTML/SVG body passthrough
 --     for user/provider content — render builds every svg body itself via svg.render.
 --   * Image embedding (T-12-04b / CODEX MEDIUM-2): constrained to GENERATED RASTER base64 ONLY.
 --     gallery accepts an imageDataUri ONLY when it matches `^data:image/jpeg;base64,` or
@@ -30,20 +31,13 @@
 -- Strictly Lua 5.1 common subset: no \u{}, no //, no goto, no <close>; unpack global.
 
 local svg = require('src.viz.svg')
+local xml = require('src.viz.xml')
 
 local M = {}
 
--- xmlEscape(s): COPIED VERBATIM from svg.lua. & MUST be escaped FIRST so the entity ampersands
--- introduced by the later replacements are not double-escaped.
-local function xmlEscape(s)
-    s = tostring(s == nil and "" or s)
-    s = s:gsub("&", "&amp;")
-    s = s:gsub("<", "&lt;")
-    s = s:gsub(">", "&gt;")
-    s = s:gsub('"', "&quot;")
-    s = s:gsub("'", "&#39;")
-    return s
-end
+-- xmlEscape: the single-source escaper (src.viz.xml), shared with svg.lua. & is escaped FIRST so
+-- the entity ampersands introduced by the later replacements are not double-escaped.
+local xmlEscape = xml.xmlEscape
 
 -- safeRasterUri(uri): STRICT raster-only guard. Returns the uri ONLY when it is a generated
 -- jpeg/png base64 data URI; nil otherwise. Deliberately STRICTER than svg.safeImageUri (which only
