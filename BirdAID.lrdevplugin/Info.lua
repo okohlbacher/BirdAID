@@ -18,7 +18,7 @@ return {
     LrSdkMinimumVersion = 6.0,
     LrToolkitIdentifier = "com.okohlbacher.birdaid",
     LrPluginName        = "BirdAID",
-    VERSION             = { major = 1, minor = 0, revision = 0, build = 0 },
+    VERSION             = { major = 1, minor = 1, revision = 2, build = 0 },
 
     -- NOTE: editing this manifest does NOT hot-reload. After changing LrLibraryMenuItems
     -- (e.g. adding the deep command), REMOVE + RE-ADD the .lrdevplugin folder in Plug-in
