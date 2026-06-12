@@ -40,8 +40,11 @@
 --   * "errors"     = response nil (identify/validate failed for that photo).
 --   * "skipped"    = no detection (bird_present false OR detections empty) OR all detections
 --                    too-coarse / all blank => nothing written.
---   identified/uncertain are counted from the DEDUPED kept set (two detections rendering to the
---   SAME string count ONCE).
+--   identified/uncertain are counted from the DEDUPED kept set, using the SAME cross-record
+--   NORMALIZED (case-fold + whitespace) dedupe as the add diff: two detections rendering to the
+--   same string — OR to case/spacing variants of the same string, across duplicate photoKey
+--   records — count ONCE. The count is INDEPENDENT of existing-on-photo names, however: a re-run
+--   whose keyword already lives on the photo still counts identified=1 while addCount drops to 0.
 --   * singleKeywordPerPhoto=true: keep ONLY the single best keyword by rank precedence
 --     species(3) > genus(2) > family(1), tie-break by higher decision.confidence (nil => -1).
 --   * DUPLICATE photoKey: ACCUMULATE deterministically — merge+dedupe addKeywords into ONE entry
@@ -83,7 +86,8 @@ function M.build(results, prefs)
     local plan = { entries = {} }
     local perPhoto = {}                 -- [photoKey] = per-photo counts
     local entryByKey = {}               -- [photoKey] = entry table (for duplicate accumulation)
-    local seenNamesByKey = {}           -- [photoKey] = { [name]=true } for cross-record dedupe
+    local seenNamesByKey = {}           -- [photoKey] = { [name]=true } for cross-record ADD dedupe
+    local countedNamesByKey = {}        -- [photoKey] = { [normName]=true } for cross-record COUNT dedupe
     local photos = 0
 
     for _, r in ipairs(results) do
@@ -165,15 +169,6 @@ function M.build(results, prefs)
                         end
                     end
 
-                    -- Tally identified / uncertain from the kept deduped set.
-                    for _, rec in ipairs(keptRecs) do
-                        if rec.rank == 'species' and not rec.uncertain then
-                            per.identified = per.identified + 1
-                        else
-                            per.uncertain = per.uncertain + 1
-                        end
-                    end
-
                     -- add-only diff: keptNames MINUS this photo's existing names, accumulated
                     -- across duplicate records (dedupe by name across records too). Comparison is
                     -- NORMALIZED (ASCII case-fold + whitespace, normName) so a keyword already on
@@ -186,10 +181,32 @@ function M.build(results, prefs)
                     end
                     local entry = entryByKey[key]
                     local addedNames = seenNamesByKey[key]   -- [normName] = true (cross-record dedupe)
+                    -- countedNames mirrors the CROSS-RECORD normalized dedupe so identified/uncertain
+                    -- counts ONCE per distinct (normalized) keyword this run — even when the keyword
+                    -- already exists on the photo (re-run still counts identified; only `addCount`
+                    -- drops to 0). It is SEPARATE from addedNames because addedNames only fills on a
+                    -- real add (not on an existing-name skip), but counting must NOT depend on existing.
+                    local countedNames = countedNamesByKey[key]   -- [normName] = true
                     for _, rec in ipairs(keptRecs) do
                         local name = rec.name
                         local nn = normName(name)
                         local already = existingNorm[nn] and true or false
+
+                        -- Tally identified / uncertain ONCE per distinct normalized name (the
+                        -- cross-record dedupe), independent of whether it already exists on the photo.
+                        if not (countedNames and countedNames[nn]) then
+                            if countedNames == nil then
+                                countedNames = {}
+                                countedNamesByKey[key] = countedNames
+                            end
+                            countedNames[nn] = true
+                            if rec.rank == 'species' and not rec.uncertain then
+                                per.identified = per.identified + 1
+                            else
+                                per.uncertain = per.uncertain + 1
+                            end
+                        end
+
                         if not already and not (addedNames and addedNames[nn]) then
                             if entry == nil then
                                 entry = { photoKey = key, photo = r.photo, addKeywords = {} }
