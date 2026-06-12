@@ -352,6 +352,11 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
                 }
             else
                 -- Upload failed: skip this photo cleanly (token/path-free reason). No handle to delete.
+                -- NEW-1: delete the per-photo exported temp JPEG BEFORE returning so a failed upload
+                -- never leaks a full-res frame into the run dir until the 6h reaper (count-only log).
+                if type(path) == 'string' and path ~= '' then
+                    pcall(function() LrFileUtils.delete(path) end)
+                end
                 log.info("deep upload produced no handle (skipping identify; run continues)", {
                     runId = runId, atIndex = job.index, file = file, reason = tostring(ureason),
                 })
@@ -378,6 +383,15 @@ LrFunctionContext.postAsyncTaskWithContext("BirdAID.DeepIdentify", function(cont
         -- Gemini is a no-op (48h auto-expiry); OpenAI never uploads (no handle). Token/path-free.
         if uploadHandle ~= nil then
             pcall(function() http.deleteFile(prefs.provider, uploadHandle, deps) end)
+        end
+
+        -- NEW-1: delete the per-photo EXPORTED temp JPEG in the SAME finally-equivalent teardown,
+        -- reached on BOTH the ok AND the error branch (whether identify succeeded, returned (nil,err),
+        -- or RAISED). Without this the full-res frames accumulate in the run dir for the whole run and
+        -- survive a crash up to the 6h reaper. The end-of-run dir cleanup + reaper remain as backstops.
+        -- Token/path-free: NEVER log `path` (PII); best-effort delete, absence is fine.
+        if type(path) == 'string' and path ~= '' then
+            pcall(function() LrFileUtils.delete(path) end)
         end
 
         -- ---- Classify the per-photo outcome (OUTSIDE any write gate) -----------------------------
