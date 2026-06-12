@@ -60,10 +60,13 @@ local PLUGIN_ID = M.PLUGIN_ID
 -- bounds retries on top of this.
 local HTTP_TIMEOUT = 60
 
--- [CODEX #7] BACKSTOP cap (bytes) on a kind='file' crop before we read+base64 it on the main
--- thread. Crops are already size-capped (maxCropEdge, 06-01); this is defence-in-depth so a
--- pathological/oversized file can never be slurped into memory. On exceed we leave both
--- image.dataUrl and image.b64 nil and the pure provider fail-fasts token-free.
+-- BACKSTOP cap (bytes) on a kind='file' image before we read+base64 it on the main thread. The
+-- live kind='file' consumer today is the DEEP path's exported full-res frame inlined for OpenAI
+-- (DeepIdentify, detail='high') — the original Phase-6 crop pass is gone. The deep export is
+-- already size-bounded (deep export edge cap), so this is defence-in-depth: a pathological /
+-- oversized frame can never be slurped into memory + base64-encoded on the main thread. On exceed
+-- we leave both image.dataUrl and image.b64 nil (and log an 'image-over-inline-cap' warning, byte
+-- counts only) so the pure provider fail-fasts token-free and the skipped deep frame is diagnosable.
 local MAX_FILE_BYTES = 8 * 1024 * 1024
 
 -- ---------------------------------------------------------------------------
@@ -127,9 +130,11 @@ end
 
 -- ---------------------------------------------------------------------------
 -- readImageBytes(image) -> rawBytes | nil. The two sources, in order:
---   * kind='bytes' (image.data) — the Phase-5 preview path.
---   * kind='file'  (image.path) — the Phase-6 crop re-query path: read the (small, size-capped)
---     crop file off disk. A missing/unreadable/over-cap source -> nil. The raw path is NEVER logged.
+--   * kind='bytes' (image.data) — the cheap preview path (preview JPEG bytes already in memory).
+--   * kind='file'  (image.path) — the DEEP inline path: read the exported (size-bounded) full-res
+--     frame off disk for OpenAI inline (DeepIdentify, detail='high'). A missing/unreadable source
+--     -> nil; an OVER-cap source -> nil PLUS an 'image-over-inline-cap' warning (byte counts only).
+--     The raw path is NEVER logged.
 -- ---------------------------------------------------------------------------
 local function readImageBytes(image)
     if type(image.data) == 'string' and image.data ~= '' then
@@ -146,6 +151,9 @@ local function readImageBytes(image)
         if okSeek then pcall(function() f:seek('set', 0) end) end
         if not withinCap then
             f:close()
+            -- SPECIFIC, token/path-free over-cap warning so a skipped deep frame is diagnosable
+            -- (byte counts only — never the path, which may be PII).
+            log.warn('image-over-inline-cap', { bytes = size, capBytes = MAX_FILE_BYTES })
             return nil
         end
         -- Bounded read: never read more than the cap + 1 byte (detect an over-running stream).
@@ -153,6 +161,10 @@ local function readImageBytes(image)
         f:close()
         if type(bytes) == 'string' and bytes ~= '' and #bytes <= MAX_FILE_BYTES then
             return bytes
+        end
+        -- A stream that over-ran the seek-reported size (or read past the cap): also diagnosable.
+        if type(bytes) == 'string' and #bytes > MAX_FILE_BYTES then
+            log.warn('image-over-inline-cap', { bytes = #bytes, capBytes = MAX_FILE_BYTES })
         end
         return nil
     end
